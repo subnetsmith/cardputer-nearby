@@ -1,0 +1,8 @@
+#!/bin/sh
+# Start the card-swapping service now and at every boot.
+set -e
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl enable nearbyd.service
+    systemctl restart nearbyd.service || true
+fi

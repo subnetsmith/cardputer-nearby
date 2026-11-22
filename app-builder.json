@@ -1,14 +1,14 @@
 {
   "package_name": "nearby",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "app_name": "Nearby",
   "bin_name": "nearby",
-  "description": "Beep when another CardputerZero running nearby is close",
+  "description": "Swap profile cards and wave at CardputerZeros close by",
   "store": {
-    "summary": "Beeps when another Cardputer running Nearby is close",
-    "description": "Each CardputerZero running Nearby sends a small anonymous Bluetooth LE beacon and listens for the others. When one comes close it beeps and shows roughly how far away it is: right here, close, nearby or far.\n\nOnly devices running Nearby can see each other. The beacon uses a random address that changes every 15 minutes, so it can't be used to follow you around.\n\nPress q to quit. Nearby uses sudo to talk to the Bluetooth chip directly. Source code is linked below.",
-    "categories": ["Radio & Comms", "Security"],
-    "screenshots": ["screenshots/screenshot-0.png"],
+    "summary": "Swap profile cards with Cardputers you pass, and wave at them",
+    "description": "Your CardputerZero carries a small profile card: a nickname, a colour, a status line and a 16x16 avatar you draw on the keyboard. Walk past anyone else running Nearby and you swap cards automatically, even with the app closed and the Cardputer in your pocket.\n\nAround shows who is in range right now, with signal bars. Met is your collection of everyone you have swapped with. Pick someone and wave at them with a short message; their Cardputer beeps and shows it.\n\nEverything is sent in the open over Bluetooth LE: anyone nearby running Nearby can read your card and waves. The radio address changes every 15 minutes, and a listen-only switch hides you completely. Mute anyone who spams.\n\nKeys: 1-4 tabs, F/X up and down, Z/C left and right, Enter to wave or edit, M to mute, Esc to leave. The background service runs as your user with one Bluetooth permission, not as root. Source code is linked below.",
+    "categories": ["Radio & Comms", "Lifestyle"],
+    "screenshots": ["screenshots/screenshot-0.png", "screenshots/screenshot-1.png", "screenshots/screenshot-2.png"],
     "icon": "packaging/icon.png",
     "license": "MIT",
     "source_repo": "https://github.com/subnetsmith/cardputer-nearby",
@@ -20,7 +20,7 @@
       "imu": false,
       "network": false,
       "additional_hardware": false,
-      "background_service": false,
+      "background_service": true,
       "external_display": false
     }
   }

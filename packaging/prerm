@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stop the service (beacon off) before the files go; on removal, also stop it starting at boot.
+set -e
+if [ -d /run/systemd/system ]; then
+    if [ "$1" = remove ]; then
+        systemctl disable --now nearbyd.service || true
+    else
+        systemctl stop nearbyd.service || true
+    fi
+fi

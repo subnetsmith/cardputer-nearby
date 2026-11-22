@@ -2,12 +2,14 @@ Package: nearby
 Version: @VERSION@
 Architecture: all
 Maintainer: subnetsmith <291419189+subnetsmith@users.noreply.github.com>
-Depends: python3, sudo
+Depends: python3, python3-pil, python3-numpy, fonts-dejavu-core
 Recommends: alsa-utils
 Section: utils
 Priority: optional
 Homepage: https://github.com/subnetsmith/cardputer-nearby
-Description: Beep when another CardputerZero running nearby is close
- Each device sends a small anonymous Bluetooth LE beacon and listens for the
- others, then beeps and shows roughly how close they are. Only devices running
- nearby can see each other. The beacon address changes every 15 minutes.
+Description: Swap profile cards and wave at CardputerZeros close by
+ Each CardputerZero running Nearby carries a small profile card (nickname,
+ colour, status, 16x16 avatar). Walk past someone else running it and you swap
+ cards automatically, even with the app closed. Wave at people around you with
+ a short message. Everything is sent in the open over Bluetooth LE; a
+ listen-only switch hides you.

@@ -36,7 +36,7 @@ AVATAR_BYTES = 32  # 16x16 pixels, 1 bit each
 
 ROTATE_SECONDS = 15 * 60  # new random radio address this often
 SLOT = 0.5                # seconds each packet is on air before the next one
-LOST_AFTER = 10.0         # off the "around" list after this long unheard
+LOST_AFTER = 30.0         # off the "around" list after this long unheard (reception has long gaps)
 NEW_MEETING = 30 * 60     # seen again after this long counts as meeting again
 WAVE_SECONDS = 20.0       # keep sending a wave this long (reception drops packets)
 # Another app using the radio raw can switch our scanning or advertising off.
