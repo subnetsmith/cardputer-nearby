@@ -1,0 +1,19 @@
+[Unit]
+Description=Nearby: swap profile cards with CardputerZeros close by
+After=bluetooth.target
+
+[Service]
+# shortcut: assumes the device's user is uid 1000 (the first user, as on CardputerZero images).
+User=1000
+Group=1000
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Raw Bluetooth needs CAP_NET_RAW; nothing else, and no root.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+ExecStart=/usr/bin/nearbyd run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
