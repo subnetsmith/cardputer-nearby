@@ -238,6 +238,11 @@ class Commands(unittest.TestCase):
         self.assertEqual((r["me"]["nick"], r["me"]["colour"], len(r["me"]["status"]), r["me"]["avatar"], r["me"]["rev"]),
                          ("Ada[31m lo", 7, 20, "ab" * 32, 1))
 
+    def test_waves_read_marks_up_to_newest(self):
+        n = nb.Node(profile("aaaaaa"), waves=[{"from": "b", "time": 5.0}, {"from": "b", "time": 9.0}])
+        self.assertEqual(n.command({"cmd": "waves_read"}, 0), {"ok": True})
+        self.assertEqual(n.me["waves_read"], 9.0)
+
     def test_unknown_command(self):
         self.assertIn("error", nb.Node(profile("aaaaaa")).command({"cmd": "rm -rf"}, 0))
 

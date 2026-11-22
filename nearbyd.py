@@ -39,6 +39,9 @@ SLOT = 0.5                # seconds each packet is on air before the next one
 LOST_AFTER = 10.0         # off the "around" list after this long unheard
 NEW_MEETING = 30 * 60     # seen again after this long counts as meeting again
 WAVE_SECONDS = 20.0       # keep sending a wave this long (reception drops packets)
+# Another app using the radio raw can switch our scanning or advertising off.
+QUIET_RESTART = 20.0      # heard no adverts at all this long: restart the radio
+REASSERT = 30.0           # switch advertising back on this often
 INBOX_MAX = 50
 
 # ---------- HCI ----------
@@ -278,6 +281,10 @@ class Node:
             self.wave_id = (self.wave_id + 1) % 256
             self.out = (wave_packet(self.me, to, self.wave_id, text), now + WAVE_SECONDS)
             return {"ok": True}
+        if cmd == "waves_read":  # the app opened the Waves tab: everything up to now is read
+            self.me["waves_read"] = max([w["time"] for w in self.waves], default=0)
+            self.changed = True
+            return {"ok": True}
         if cmd == "listen_only":
             self.me["listen_only"] = bool(req.get("on"))
             self.changed = True
@@ -481,7 +488,8 @@ def serve(dev, quiet):
         os.close(fd)
         make_beep(sound)
         os.chmod(sound, 0o644)  # readable by the sudo user who plays it
-    rotate_at = slot_at = save_at = 0.0
+    rotate_at = slot_at = save_at = reassert_at = 0.0
+    heard_at = time.monotonic()
     advertising = None
     slot = 0
     print(f"nearbyd: card {node.me['id']} ({node.me['nick']}), socket {socket_path()}", flush=True)
@@ -489,9 +497,15 @@ def serve(dev, quiet):
         while True:
             now = time.monotonic()
             want = not node.me["listen_only"]
+            if now - heard_at > QUIET_RESTART:
+                print("nearbyd: radio went quiet (another app?), restarting it", flush=True)
+                rotate_at, heard_at = now, now
             if now >= rotate_at or want != advertising:
                 radio.start(node.schedule(now)[0], want)
-                advertising, rotate_at = want, now + ROTATE_SECONDS
+                advertising, rotate_at, reassert_at = want, now + ROTATE_SECONDS, now + REASSERT
+            if want and now >= reassert_at:
+                radio.send(LE_SET_ADV_ENABLE, b"\1", check=False)
+                reassert_at = now + REASSERT
             if want and now >= slot_at:
                 seq = node.schedule(now)
                 radio.set_packet(seq[slot % len(seq)])
@@ -499,6 +513,7 @@ def serve(dev, quiet):
             ready = select.select([radio.sock, server], [], [], 0.1)[0]
             if radio.sock in ready:
                 for _, data, rssi in adv_reports(radio.sock.recv(260)):
+                    heard_at = now
                     if node.on_advert(data, rssi, now, time.time()) and not quiet:
                         beep(sound)
             if server in ready:
