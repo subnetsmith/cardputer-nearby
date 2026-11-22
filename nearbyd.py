@@ -53,6 +53,7 @@ LOST_AFTER = 30.0         # off the "around" list after this long unheard (recep
 NEW_MEETING = 30 * 60     # seen again after this long counts as meeting again
 TEXT_SECONDS = 120.0      # keep resending a text until its receipt arrives, at most this long
 ACK_SECONDS = 30.0        # keep sending a receipt this long
+IDLE_EXIT = 60.0          # with Background off: stop this long after the app's last request
 # Another app using the radio raw can switch our scanning or advertising off.
 QUIET_RESTART = 20.0      # heard no adverts at all this long: restart the radio
 REASSERT = 30.0           # switch advertising back on this often
@@ -262,7 +263,7 @@ def new_profile():
     key, pub = new_keypair()
     return {"id": cid, "nick": "anon-" + cid[:4], "colour": secrets.randbelow(COLOURS),
             "status": "", "avatar": "00" * AVATAR_BYTES, "rev": 0,
-            "listen_only": False, "muted": [], "key": key, "pub": pub, "tx": 0}
+            "listen_only": False, "background": True, "muted": [], "key": key, "pub": pub, "tx": 0}
 
 
 class Node:
@@ -442,6 +443,10 @@ class Node:
             self.me["waves_read"] = max([w["time"] for w in self.waves], default=0)
             self.changed = True
             return {"ok": True}
+        if cmd == "background":
+            self.me["background"] = bool(req.get("on"))
+            self.changed = True
+            return {"ok": True}
         if cmd == "listen_only":
             self.me["listen_only"] = bool(req.get("on"))
             self.changed = True
@@ -509,9 +514,27 @@ def data_dir():
     return os.path.join(base, "nearby")
 
 
+SYSTEM_SOCKET = "/run/nearby.sock"  # nearbyd.socket: systemd starts the service when the app connects
+
+
 def socket_path():
+    """Where a service started by hand (not by systemd) listens."""
     run = os.environ.get("XDG_RUNTIME_DIR")
     return os.path.join(run, "nearby.sock") if run else f"/tmp/nearby-{os.getuid()}.sock"
+
+
+def client_path():
+    """Where the app and command line connect: a hand-started service if there is one, else systemd's."""
+    if os.environ.get("NEARBY_SOCKET"):
+        return os.environ["NEARBY_SOCKET"]
+    return socket_path() if os.path.exists(socket_path()) else SYSTEM_SOCKET
+
+
+def systemd_socket():
+    """The listening socket systemd handed over (socket activation), or None."""
+    if os.environ.get("LISTEN_PID") == str(os.getpid()) and int(os.environ.get("LISTEN_FDS", "0")) >= 1:
+        return socket.socket(fileno=3)  # SD_LISTEN_FDS_START
+    return None
 
 
 def load_json(path, default):
@@ -671,7 +694,8 @@ def serve(dev, quiet):
     folder = data_dir()
     node = load_node(folder)
     radio = Radio(dev)
-    server = listen(socket_path())
+    handed = systemd_socket()
+    server = handed or listen(socket_path())
     sound = None
     if not quiet:
         fd, sound = tempfile.mkstemp(suffix=".wav")
@@ -679,13 +703,17 @@ def serve(dev, quiet):
         make_beep(sound)
         os.chmod(sound, 0o644)  # readable by the sudo user who plays it
     rotate_at = slot_at = save_at = reassert_at = 0.0
-    heard_at = time.monotonic()
+    heard_at = asked_at = time.monotonic()
     advertising = None
     slot = 0
-    print(f"nearbyd: card {node.me['id']} ({node.me['nick']}), socket {socket_path()}", flush=True)
+    print(f"nearbyd: card {node.me['id']} ({node.me['nick']}), "
+          f"socket {SYSTEM_SOCKET if handed else socket_path()}", flush=True)
     try:
         while True:
             now = time.monotonic()
+            if not node.me.get("background", True) and now - asked_at > IDLE_EXIT:
+                print("nearbyd: background is off and the app is closed, stopping", flush=True)
+                return
             want = not node.me["listen_only"]
             if now - heard_at > QUIET_RESTART:
                 print("nearbyd: radio went quiet (another app?), restarting it", flush=True)
@@ -708,6 +736,7 @@ def serve(dev, quiet):
                         beep(sound)
             if server in ready:
                 answer(server, node, now)
+                asked_at = now
             if node.urgent or (node.changed and now >= save_at):
                 # urgent: a text's counter is saved before any of its fragments go on air
                 save_node(folder, node)
@@ -715,8 +744,11 @@ def serve(dev, quiet):
     finally:
         radio.stop()
         save_node(folder, node)
-        server.close()
-        os.unlink(socket_path())
+        if handed:
+            handed.detach()  # systemd owns it and keeps listening for the next app start
+        else:
+            server.close()
+            os.unlink(socket_path())
         if sound:
             os.remove(sound)
 
@@ -726,8 +758,8 @@ def serve(dev, quiet):
 def ask(req, path=None):
     """Send one request to the running service and return its reply."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(3)
-        s.connect(path or socket_path())
+        s.settimeout(10)  # the first request may wait while systemd starts the service
+        s.connect(path or client_path())
         s.sendall(json.dumps(req).encode() + b"\n")
         buf = b""
         while not buf.endswith(b"\n"):
@@ -748,7 +780,8 @@ def ago(seconds):
 def show_status(state, wall):
     me = state["me"]
     print(f"Me: {me['nick']} (card {me['id']}, colour {me['colour']}) \"{me['status']}\""
-          + ("  [listen-only]" if me["listen_only"] else ""))
+          + ("  [listen-only]" if me["listen_only"] else "")
+          + ("" if me.get("background", True) else "  [background off]"))
     print(f"Around now: {len(state['around'])}")
     for p in state["around"]:
         print(f"  {p['nick']:<10} {p['rssi']:>4} dBm  \"{p['status']}\"")
@@ -787,6 +820,8 @@ def main(argv=None):
     tx.add_argument("text")
     lo = sub.add_parser("listen", help="listen-only on/off (on = send nothing)")
     lo.add_argument("on", choices=["on", "off"])
+    bg = sub.add_parser("background", help="background on/off (off = only run while the app is open)")
+    bg.add_argument("on", choices=["on", "off"])
     args = ap.parse_args(argv)
 
     if args.cmd == "run":
@@ -822,6 +857,8 @@ def main(argv=None):
             if len(match) != 1:
                 sys.exit(f"No single person called {args.nick!r} in your Met list.")
             reply = ask({"cmd": "text", "to": match[0], "text": args.text})
+        elif args.cmd == "background":
+            reply = ask({"cmd": "background", "on": args.on == "on"})
         else:
             reply = ask({"cmd": "listen_only", "on": args.on == "on"})
     except (FileNotFoundError, ConnectionRefusedError):

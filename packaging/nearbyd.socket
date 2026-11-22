@@ -1,0 +1,12 @@
+[Unit]
+Description=Nearby: starts the service when the app opens
+
+[Socket]
+ListenStream=/run/nearby.sock
+# Only the device's user (uid 1000, same as the service) may talk to it.
+SocketUser=1000
+SocketGroup=1000
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

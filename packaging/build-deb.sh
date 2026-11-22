@@ -15,6 +15,7 @@ for name in nearby nearbyd; do
     chmod 755 "$ROOT/usr/bin/$name"
 done
 install -Dm644 packaging/nearbyd.service "$ROOT/usr/lib/systemd/system/nearbyd.service"
+install -Dm644 packaging/nearbyd.socket "$ROOT/usr/lib/systemd/system/nearbyd.socket"
 install -Dm644 packaging/nearby.desktop "$ROOT/usr/share/APPLaunch/applications/nearby.desktop"
 install -Dm644 packaging/nearby-launcher.png "$ROOT/usr/share/APPLaunch/share/images/nearby.png"
 install -Dm644 LICENSE "$ROOT/usr/share/doc/nearby/copyright"

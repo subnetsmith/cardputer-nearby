@@ -1,8 +1,9 @@
 #!/bin/sh
-# Start the card-swapping service now and at every boot.
+# Start the card-swapping service now and at every boot, and let the app start it on demand.
 set -e
 if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
     systemctl daemon-reload
-    systemctl enable nearbyd.service
+    systemctl enable nearbyd.socket nearbyd.service
+    systemctl restart nearbyd.socket || true
     systemctl restart nearbyd.service || true
 fi

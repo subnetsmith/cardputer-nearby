@@ -3,8 +3,8 @@
 set -e
 if [ -d /run/systemd/system ]; then
     if [ "$1" = remove ]; then
-        systemctl disable --now nearbyd.service || true
+        systemctl disable --now nearbyd.service nearbyd.socket || true
     else
-        systemctl stop nearbyd.service || true
+        systemctl stop nearbyd.service nearbyd.socket || true
     fi
 fi

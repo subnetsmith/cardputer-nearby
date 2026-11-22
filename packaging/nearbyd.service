@@ -1,6 +1,9 @@
 [Unit]
 Description=Nearby: swap profile cards with CardputerZeros close by
-After=bluetooth.target
+After=bluetooth.target nearbyd.socket
+# The app talks to it through nearbyd.socket, which also starts it on demand
+# when the Background setting is off and it has stopped itself.
+Requires=nearbyd.socket
 
 [Service]
 # shortcut: assumes the device's user is uid 1000 (the first user, as on CardputerZero images).
@@ -12,6 +15,7 @@ AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=yes
 ExecStart=/usr/bin/nearbyd run
+# Stopping itself (Background off) exits 0, so only a crash restarts it.
 Restart=on-failure
 RestartSec=10
 

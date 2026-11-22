@@ -376,6 +376,40 @@ class Commands(unittest.TestCase):
         self.assertEqual(n.command({"cmd": "waves_read"}, 0), {"ok": True})
         self.assertEqual(n.me["waves_read"], 9.0)
 
+    def test_background_setting(self):
+        n = nb.Node(profile("aaaaaa"))
+        self.assertTrue(n.me.get("background", True))   # on unless switched off; old cards have no field
+        n.command({"cmd": "background", "on": False}, 0)
+        self.assertFalse(n.me["background"])
+        self.assertFalse(n.command({"cmd": "state"}, 0)["me"]["background"])
+        self.assertTrue(nb.new_profile()["background"])
+
+    def test_client_finds_the_right_socket(self):
+        env = dict(os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                os.environ.pop("NEARBY_SOCKET", None)
+                os.environ["XDG_RUNTIME_DIR"] = d
+                self.assertEqual(nb.client_path(), nb.SYSTEM_SOCKET)       # installed: systemd's socket
+                open(os.path.join(d, "nearby.sock"), "w").close()
+                self.assertEqual(nb.client_path(), os.path.join(d, "nearby.sock"))  # a hand-started service
+                os.environ["NEARBY_SOCKET"] = "/x/y.sock"
+                self.assertEqual(nb.client_path(), "/x/y.sock")
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
+
+    def test_not_socket_activated_without_systemd(self):
+        env = dict(os.environ)
+        try:
+            os.environ.pop("LISTEN_PID", None)
+            self.assertIsNone(nb.systemd_socket())
+            os.environ.update(LISTEN_PID="1", LISTEN_FDS="1")  # meant for another process
+            self.assertIsNone(nb.systemd_socket())
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
+
     def test_unknown_command(self):
         self.assertIn("error", nb.Node(profile("aaaaaa")).command({"cmd": "rm -rf"}, 0))
 
