@@ -1,345 +1,276 @@
 #!/usr/bin/env python3
-"""nearby: beep when another CardputerZero running this program is close by.
+"""nearby: the Nearby app for the CardputerZero's 320x170 screen.
 
-Each device sends a small anonymous Bluetooth LE beacon and listens for the
-others. It talks to the Bluetooth chip directly over a raw HCI socket, so it
-needs Linux, root and nothing else (standard library only).
+Shows who is around right now and everyone you have met, from the cards the
+nearbyd service collects. Draws with Pillow straight to the framebuffer and
+reads the built-in keyboard directly.
+
+Keys: 1 Around, 2 Met, up/down to move, Esc or q to quit.
+`nearby --snapshot out.png` draws one frame to a PNG instead.
 """
 import argparse
 import os
-import secrets
 import select
-import shutil
 import signal
-import socket
 import struct
-import subprocess
 import sys
-import tempfile
 import time
-import wave
 
-# Marker every beacon carries (128-bit UUID, little-endian as sent on air).
-SERVICE_UUID = bytes.fromhex("640a06fbd254461a80d7eb3e1ea00ebf")[::-1]
-VERSION = 1
-ROTATE_SECONDS = 15 * 60  # new random address this often, so nobody can track you
-LOST_AFTER = 10.0         # seconds without a beacon before someone counts as gone
-SETTLE = 5.0              # wait before beeping for a new address; longer than the worst gap seen (4.4 s)
+from PIL import Image, ImageDraw, ImageFont
 
-HCI_COMMAND_PKT, HCI_EVENT_PKT = 0x01, 0x04
-EVT_CMD_COMPLETE, EVT_CMD_STATUS, EVT_LE_META = 0x0E, 0x0F, 0x3E
-LE_ADV_REPORT = 0x02
-AD_SERVICE_DATA_128 = 0x21
+import nearbyd
 
+W, H = 320, 170
+TOP, BOTTOM, ROW = 22, 15, 33
+ROWS = (H - TOP - BOTTOM) // ROW  # 4 rows fit
 
-def _le(ocf):
-    return (0x08 << 10) | ocf  # OGF 0x08 = LE controller commands
+BG, PANEL, LINE = (20, 22, 26), (34, 37, 44), (52, 56, 64)
+TEXT, DIM, ACCENT = (232, 234, 237), (140, 146, 156), (255, 122, 26)
+# Card colours 0-7, in the order the Me screen offers them.
+PALETTE = [(255, 122, 26), (64, 196, 255), (80, 220, 120), (255, 94, 160),
+           (255, 214, 10), (170, 120, 255), (255, 80, 70), (90, 140, 255)]
 
-
-LE_SET_RANDOM_ADDR = _le(0x05)
-LE_SET_ADV_PARAMS = _le(0x06)
-LE_SET_ADV_DATA = _le(0x08)
-LE_SET_ADV_ENABLE = _le(0x0A)
-LE_SET_SCAN_PARAMS = _le(0x0B)
-LE_SET_SCAN_ENABLE = _le(0x0C)
+FONT_DIRS = [os.environ.get("NEARBY_FONT_DIR", ""), "/usr/share/fonts/truetype/dejavu"]
 
 
-class HciError(Exception):
-    pass
+def font(name, size):
+    for d in FONT_DIRS:
+        path = os.path.join(d, name)
+        if d and os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()  # shortcut: plain bitmap font if DejaVu is missing
 
 
-# ---------- packets ----------
+BOLD, REG, SMALL = font("DejaVuSans-Bold.ttf", 13), font("DejaVuSans.ttf", 11), font("DejaVuSans.ttf", 10)
 
-def command(opcode, params=b""):
-    return struct.pack("<BHB", HCI_COMMAND_PKT, opcode, len(params)) + params
-
-
-def hci_filter():
-    """Kernel filter: only events, and only command replies + LE meta events."""
-    ev = (1 << EVT_CMD_COMPLETE) | (1 << EVT_CMD_STATUS) | (1 << EVT_LE_META)
-    return struct.pack("<IIIH2x", 1 << HCI_EVENT_PKT, ev & 0xFFFFFFFF, ev >> 32, 0)
+# evdev key codes from linux/input-event-codes.h
+KEY_ESC, KEY_1, KEY_2, KEY_Q = 1, 2, 3, 16
+KEY_UP, KEY_DOWN = 103, 108
+KEYBOARD = "/dev/input/cardputer-zero-internal"
 
 
-def adv_data():
-    """LE Set Advertising Data parameters: length byte + 31 bytes of AD structures."""
-    body = SERVICE_UUID + bytes([VERSION])
-    ad = bytes([len(body) + 1, AD_SERVICE_DATA_128]) + body
-    return bytes([len(ad)]) + ad.ljust(31, b"\0")
+# ---------- drawing pieces ----------
+
+def avatar(hexbits, colour, nick, size=28):
+    """16x16 1-bit picture (2 bytes a row, leftmost pixel in the top bit) in the card's colour.
+    A blank avatar shows the nickname's first letter instead."""
+    colour = PALETTE[colour % len(PALETTE)]
+    bits = bytes.fromhex(hexbits)
+    if not any(bits):
+        img = Image.new("RGB", (size, size), colour)
+        ImageDraw.Draw(img).text((size / 2, size / 2), (nick[:1] or "?").upper(),
+                                 font=BOLD, fill=BG, anchor="mm")
+        return img
+    img = Image.new("RGB", (16, 16), PANEL)
+    px = img.load()
+    for y in range(16):
+        row = bits[2 * y] << 8 | bits[2 * y + 1]
+        for x in range(16):
+            if row >> (15 - x) & 1:
+                px[x, y] = colour
+    return img.resize((size, size), Image.NEAREST)
 
 
-def ad_structures(data):
-    i = 0
-    while i < len(data):
-        n = data[i]
-        if n == 0 or i + 1 + n > len(data):
-            return
-        yield data[i + 1], data[i + 2:i + 1 + n]
-        i += 1 + n
+def signal_bars(rssi):
+    """1-4 bars, same bands the old version used: right here, close, nearby, far."""
+    return 4 if rssi >= -55 else 3 if rssi >= -70 else 2 if rssi >= -85 else 1
 
 
-def is_beacon(data):
-    return any(t == AD_SERVICE_DATA_128 and v[:16] == SERVICE_UUID
-               for t, v in ad_structures(data))
+def fit(draw, text, fnt, width):
+    """Cut text with an ellipsis so it fits the given pixel width."""
+    if draw.textlength(text, font=fnt) <= width:
+        return text
+    while text and draw.textlength(text + "…", font=fnt) > width:
+        text = text[:-1]
+    return text + "…"
 
 
-def addr_str(raw):
-    return ":".join(f"{b:02X}" for b in reversed(raw))
+def short_ago(seconds):
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= n:
+            return f"{int(seconds // n)}{unit} ago"
+    return "now"
 
 
-def adv_reports(packet):
-    """Yield (address, ad_data, rssi) from one HCI event; ignore anything else."""
-    if len(packet) < 5 or packet[0] != HCI_EVENT_PKT or packet[1] != EVT_LE_META \
-            or packet[3] != LE_ADV_REPORT:
-        return
-    i = 5
-    for _ in range(packet[4]):
-        if i + 9 > len(packet):
-            return
-        n = packet[i + 8]
-        end = i + 9 + n
-        if end >= len(packet):  # data plus the RSSI byte must fit
-            return
-        rssi = struct.unpack("b", packet[end:end + 1])[0]
-        yield addr_str(packet[i + 2:i + 8]), packet[i + 9:end], rssi
-        i = end + 1
+def radar(d, cx, cy, colour):
+    d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=colour)
+    for r in (12, 20, 28):
+        d.arc([cx - r, cy - r, cx + r, cy + r], -50, 50, fill=colour, width=3)
+        d.arc([cx - r, cy - r, cx + r, cy + r], 130, 230, fill=colour, width=3)
 
 
-def command_reply(packet):
-    """Return (opcode, status) if this event answers a command, else None."""
-    if len(packet) >= 7 and packet[0] == HCI_EVENT_PKT and packet[1] == EVT_CMD_COMPLETE:
-        return struct.unpack("<H", packet[4:6])[0], packet[6]
-    if len(packet) >= 7 and packet[0] == HCI_EVENT_PKT and packet[1] == EVT_CMD_STATUS:
-        return struct.unpack("<H", packet[5:7])[0], packet[3]
-    return None
+def message(d, title, lines, icon=True):
+    y = TOP + 18
+    if icon:
+        radar(d, W // 2, y + 18, LINE)
+        y += 46
+    d.text((W // 2, y), title, font=BOLD, fill=TEXT, anchor="mm")
+    for i, line in enumerate(lines):
+        d.text((W // 2, y + 18 + 14 * i), line, font=SMALL, fill=DIM, anchor="mm")
 
 
-def new_private_address(rand=secrets.token_bytes):
-    """Non-resolvable private address: top two bits 00, rest random, not all 0s or 1s."""
-    while True:
-        a = bytearray(rand(6))
-        a[5] &= 0x3F
-        if 0 < int.from_bytes(a, "little") < (1 << 46) - 1:
-            return bytes(a)
+# ---------- whole screens ----------
 
+def render(view, state, sel, wall):
+    """One frame. view is "around" or "met"; state is the service's reply, or None if it's down."""
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
 
-# ---------- who is around ----------
+    # top bar: name and the two tabs
+    d.rectangle([0, 0, W, TOP - 1], fill=PANEL)
+    d.text((8, TOP // 2), "Nearby", font=BOLD, fill=ACCENT, anchor="lm")
+    tabs = [("around", f"1 Around {len(state['around'])}" if state else "1 Around"),
+            ("met", f"2 Met {len(state['met'])}" if state else "2 Met")]
+    x = W - 6
+    for key, label in reversed(tabs):
+        tw = d.textlength(label, font=REG)
+        x -= tw
+        d.text((x, TOP // 2), label, font=REG, fill=TEXT if key == view else DIM, anchor="lm")
+        if key == view:
+            d.rectangle([x, TOP - 3, x + tw, TOP - 1], fill=ACCENT)
+        x -= 12
 
-def distance_label(rssi):
-    # shortcut: fixed RSSI bands; walls and pockets shift these, so it is a rough guide only.
-    if rssi >= -55:
-        return "right here"
-    if rssi >= -70:
-        return "close"
-    if rssi >= -85:
-        return "nearby"
-    return "far"
+    # bottom bar: keys, and listen-only when it's on
+    d.line([0, H - BOTTOM, W, H - BOTTOM], fill=LINE)
+    d.text((6, H - BOTTOM / 2), "↑↓ move   1/2 tabs   Esc quit", font=SMALL, fill=DIM, anchor="lm")
+    if state and state["me"]["listen_only"]:
+        d.text((W - 6, H - BOTTOM / 2), "LISTEN-ONLY", font=SMALL, fill=ACCENT, anchor="rm")
 
+    if state is None:
+        message(d, "Nearby service isn't running", ["Start it with:", "sudo systemctl start nearbyd"], icon=False)
+        return img
 
-class Tracker:
-    def __init__(self):
-        self.peers = {}  # address -> {"first", "last", "rssi": [...], "new": bool}
-
-    def seen(self, addr, rssi, now):
-        p = self.peers.setdefault(addr, {"first": now, "last": now, "rssi": [], "new": True})
-        p["last"] = now
-        p["rssi"] = (p["rssi"] + [rssi])[-5:]
-
-    def tick(self, now):
-        """Forget people who went quiet; return how many new people arrived."""
-        # Off screen after LOST_AFTER, but kept SETTLE longer so a late new address can still match it.
-        for addr in [a for a, p in self.peers.items() if now - p["last"] > LOST_AFTER + SETTLE]:
-            del self.peers[addr]
-        arrivals = 0
-        for addr, p in list(self.peers.items()):
-            if not p["new"] or now - p["first"] < SETTLE:
-                continue
-            p["new"] = False
-            # Same person, fresh address: an older address went quiet before this one started
-            # and has stayed quiet since. Reception drops beacons for seconds at a time (Wi-Fi
-            # shares the radio), so this can't rely on tight timing.
-            # shortcut: someone arriving within ~15 s of another leaving gets no beep; rare enough.
-            old = max((a for a, q in self.peers.items() if a != addr and not q["new"]
-                       and q["last"] <= p["first"] + 0.5 and now - q["last"] >= SETTLE),
-                      key=lambda a: self.peers[a]["last"], default=None)
-            if old:
-                del self.peers[old]
-            else:
-                arrivals += 1
-        return arrivals
-
-    def present(self, now):
-        """(label, average rssi) for everyone heard recently, strongest first."""
-        out = [sum(p["rssi"]) // len(p["rssi"]) for p in self.peers.values()
-               if not p["new"] and now - p["last"] <= LOST_AFTER]
-        return [(distance_label(r), r) for r in sorted(out, reverse=True)]
-
-
-def screen(people):
-    """Fits the 320x170 screen's console (40 columns, 10 rows)."""
+    people = state[view]
     if not people:
-        return "NEARBY\n\nNo other Cardputers around.\n\nListening...  (q to quit)"
-    head = f"NEARBY  {len(people)} other Cardputer{'s' if len(people) > 1 else ''}"
-    rows = [f"{i}. {label:<11}{rssi:>5} dBm" for i, (label, rssi) in enumerate(people[:7], 1)]
-    if len(people) > 7:
-        rows.append(f"   ...and {len(people) - 7} more")
-    return "\n".join([head, ""] + rows)
+        if view == "around":
+            hint = ["You're in listen-only mode: others can't see you."] if state["me"]["listen_only"] \
+                else ["Cards swap by themselves when someone", "running Nearby comes close."]
+            message(d, "No one around right now", hint)
+        else:
+            message(d, "No one met yet", ["Keep Nearby on in your pocket.", "People you pass show up here."])
+        return img
+
+    first = min(max(0, sel - ROWS + 1), max(0, len(people) - ROWS))
+    for i, p in enumerate(people[first:first + ROWS]):
+        y = TOP + 1 + i * ROW
+        if first + i == sel:
+            d.rectangle([0, y, W, y + ROW - 2], fill=PANEL)
+            d.rectangle([0, y, 2, y + ROW - 2], fill=ACCENT)
+        img.paste(avatar(p["avatar"], p["colour"], p["nick"]), (8, y + 2))
+        if view == "around":
+            bars = signal_bars(p["rssi"])
+            for b in range(4):
+                h = 4 + 3 * b
+                bx = W - 30 + b * 6
+                d.rectangle([bx, y + 22 - h, bx + 3, y + 22], fill=PALETTE[p["colour"]] if b < bars else LINE)
+            right = 40
+        else:
+            d.text((W - 8, y + 9), f"×{p['count']}", font=REG, fill=TEXT, anchor="rm")
+            d.text((W - 8, y + 23), short_ago(wall - p["last"]), font=SMALL, fill=DIM, anchor="rm")
+            right = 64
+        width = W - 44 - right
+        d.text((44, y + 9), fit(d, p["nick"], BOLD, width), font=BOLD, fill=TEXT, anchor="lm")
+        d.text((44, y + 23), fit(d, p["status"] or "-", SMALL, width), font=SMALL, fill=DIM, anchor="lm")
+    if len(people) > ROWS:  # scroll position
+        top_px = TOP + (H - TOP - BOTTOM) * first // len(people)
+        size = (H - TOP - BOTTOM) * ROWS // len(people)
+        d.rectangle([W - 2, top_px, W - 1, top_px + size], fill=DIM)
+    return img
 
 
-# ---------- sound ----------
+# ---------- hardware ----------
 
-def make_beep(path):
-    rate = 16000
-    frames = bytearray()
-    for freq in (880, 1320):
-        for n in range(rate // 8):
-            frames += struct.pack("<h", 9000 if (n * freq * 2 // rate) % 2 else -9000)
-        frames += bytes(2 * rate // 20)
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(bytes(frames))
+def rgb565(img):
+    """Pack an RGB image into the screen's 16-bit format (red in the top 5 bits, little-endian)."""
+    import numpy as np
+    a = np.asarray(img, dtype=np.uint16)
+    return ((a[..., 0] >> 3) << 11 | (a[..., 1] >> 2) << 5 | a[..., 2] >> 3).astype("<u2").tobytes()
 
 
-def beep_command(path, env, euid):
-    cmd = ["aplay", "-q", path]
-    user, uid = env.get("SUDO_USER"), env.get("SUDO_UID", "")
-    if euid == 0 and user and uid.isdigit():
-        # Under sudo, root can't reach the user's sound server (PipeWire), so play as them.
-        cmd = ["runuser", "-u", user, "--", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}"] + cmd
-    return cmd
+class Screen:
+    def __init__(self, path="/dev/fb0"):
+        self.fd = os.open(path, os.O_RDWR)
+        self.last = None
+
+    def show(self, img):
+        data = rgb565(img)
+        if data != self.last:  # the stride is exactly 320*2, so one write covers the screen
+            os.pwrite(self.fd, data, 0)
+            self.last = data
 
 
-def beep(path):
-    if path and shutil.which("aplay"):
-        subprocess.Popen(beep_command(path, os.environ, os.geteuid()), stderr=subprocess.DEVNULL)
-    else:
-        sys.stdout.write("\a")
+EVENT = struct.Struct("llHHi")  # struct input_event: time, type, code, value
+EV_KEY = 1
 
 
-# ---------- the Bluetooth chip ----------
-
-class Radio:
-    def __init__(self, dev):
-        self.sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
-        self.sock.setsockopt(socket.SOL_HCI, socket.HCI_FILTER, hci_filter())
-        self.sock.bind((dev,))
-
-    def send(self, opcode, params=b"", check=True):
-        self.sock.send(command(opcode, params))
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            self.sock.settimeout(max(0.01, deadline - time.monotonic()))
-            try:
-                reply = command_reply(self.sock.recv(260))
-            except socket.timeout:
-                break
-            if reply and reply[0] == opcode:
-                if check and reply[1]:
-                    raise HciError(f"command 0x{opcode:04X} failed with status 0x{reply[1]:02X}")
-                return reply[1]
-        raise HciError(f"no reply to command 0x{opcode:04X}")
-
-    def start(self):
-        """(Re)start with a fresh random address. The chip refuses an address change mid-scan."""
-        self.send(LE_SET_SCAN_ENABLE, b"\0\0", check=False)
-        self.send(LE_SET_ADV_ENABLE, b"\0", check=False)
-        self.send(LE_SET_RANDOM_ADDR, new_private_address())
-        # 100-150 ms, non-connectable, random own address, all three channels
-        self.send(LE_SET_ADV_PARAMS, struct.pack("<HHBBB6sBB", 0xA0, 0xF0, 0x03, 0x01, 0, bytes(6), 0x07, 0))
-        self.send(LE_SET_ADV_DATA, adv_data())
-        self.send(LE_SET_ADV_ENABLE, b"\1")
-        # passive scan, 60 ms window every 60 ms, keep duplicates so RSSI stays fresh
-        self.send(LE_SET_SCAN_PARAMS, struct.pack("<BHHBB", 0, 0x60, 0x60, 0, 0))
-        self.send(LE_SET_SCAN_ENABLE, b"\1\0")
-
-    def stop(self):
-        for op, arg in ((LE_SET_ADV_ENABLE, b"\0"), (LE_SET_SCAN_ENABLE, b"\0\0")):
-            try:
-                self.send(op, arg, check=False)
-            except (OSError, HciError):
-                pass
-        self.sock.close()
+def key_presses(buf):
+    """Key codes pressed (or auto-repeated) in a buffer of raw input events."""
+    out = []
+    for off in range(0, len(buf) - EVENT.size + 1, EVENT.size):
+        _, _, etype, code, value = EVENT.unpack_from(buf, off)
+        if etype == EV_KEY and value in (1, 2):
+            out.append(code)
+    return out
 
 
-def quit_pressed(fd):
-    """q or a lone Esc waiting on fd? (An arrow key also starts with Esc, so it doesn't count.)"""
-    if not select.select([fd], [], [], 0)[0]:
-        return False
-    data = os.read(fd, 32)
-    return data[:1] in (b"q", b"Q") or data == b"\x1b"
+def handle(code, view, sel, count):
+    """Returns (view, sel, quit)."""
+    if code in (KEY_ESC, KEY_Q):
+        return view, sel, True
+    if code == KEY_1:
+        return "around", 0, False
+    if code == KEY_2:
+        return "met", 0, False
+    if code == KEY_UP:
+        return view, max(0, sel - 1), False
+    if code == KEY_DOWN:
+        return view, min(max(0, count - 1), sel + 1), False
+    return view, sel, False
 
 
-def run(dev, quiet):
-    radio = Radio(dev)
-    tracker = Tracker()
-    sound = None
-    if not quiet:
-        fd, sound = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        make_beep(sound)
-        os.chmod(sound, 0o644)  # readable by the sudo user who plays it
-    keys = None
-    if sys.stdin.isatty():  # launched from the Cardputer's terminal: read single keys, no echo
-        import termios
-        import tty
-        keys = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin)
-    rotate_at = drawn_at = 0.0
+def fetch():
+    try:
+        return nearbyd.ask({"cmd": "state"})
+    except OSError:
+        return None
+
+
+def run():
+    screen = Screen()
+    keys = os.open(KEYBOARD, os.O_RDONLY | os.O_NONBLOCK)
+    view, sel, state, fetched = "around", 0, None, 0.0
     try:
         while True:
-            if keys and quit_pressed(sys.stdin.fileno()):
-                raise KeyboardInterrupt
             now = time.monotonic()
-            if now >= rotate_at:
-                radio.start()
-                rotate_at = now + ROTATE_SECONDS
-            radio.sock.settimeout(0.5)
-            try:
-                packet = radio.sock.recv(260)
-            except socket.timeout:
-                packet = b""
-            for addr, data, rssi in adv_reports(packet):
-                if is_beacon(data):
-                    tracker.seen(addr, rssi, now)
-            if tracker.tick(now) and not quiet:
-                beep(sound)
-            if now - drawn_at >= 1:
-                sys.stdout.write("\033[H\033[J" + screen(tracker.present(now)) + "\n")
-                sys.stdout.flush()
-                drawn_at = now
+            if now - fetched >= 1:
+                state, fetched = fetch(), now
+            count = len(state[view]) if state else 0
+            sel = min(sel, max(0, count - 1))
+            screen.show(render(view, state, sel, time.time()))
+            if select.select([keys], [], [], 0.25)[0]:
+                for code in key_presses(os.read(keys, EVENT.size * 32)):
+                    view, sel, done = handle(code, view, sel, count)
+                    if done:
+                        return
     finally:
-        radio.stop()
-        if keys:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, keys)
-        if sound:
-            os.remove(sound)
-
-
-def _stop(*_):
-    raise KeyboardInterrupt
+        os.close(keys)  # the launcher redraws itself once we exit
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Beep when another Cardputer running nearby is close.")
-    ap.add_argument("--hci", type=int, default=0, help="Bluetooth adapter number (default 0 = hci0)")
-    ap.add_argument("--quiet", action="store_true", help="no sound, screen only")
+    ap = argparse.ArgumentParser(description="Nearby: see who is around and who you have met.")
+    ap.add_argument("--snapshot", metavar="PNG", help="draw one frame to a PNG file and exit")
+    ap.add_argument("--view", choices=["around", "met"], default="around")
     args = ap.parse_args(argv)
-    if not sys.platform.startswith("linux"):
-        sys.exit("nearby needs Linux (it talks to the Bluetooth chip directly).")
-    # Stop cleanly (beacon off) on Ctrl+C, kill or service stop, even when started in the background.
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _stop)
+    if args.snapshot:
+        render(args.view, fetch(), 0, time.time()).save(args.snapshot)
+        return
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # the launcher closing us: exit cleanly
     try:
-        run(args.hci, args.quiet)
+        run()
     except KeyboardInterrupt:
-        print("\nStopped. Beacon off.")
-    except PermissionError:
-        sys.exit("Needs root to drive Bluetooth directly: sudo nearby")
+        pass
     except OSError as e:
-        sys.exit(f"Bluetooth problem ({e}). Is it on? Try: sudo rfkill unblock bluetooth && bluetoothctl power on")
-    except HciError as e:
-        sys.exit(f"The Bluetooth chip said no: {e}. Another app may be scanning; close it and retry.")
+        sys.exit(f"nearby: can't open the screen or keyboard ({e}).")
 
 
 if __name__ == "__main__":
