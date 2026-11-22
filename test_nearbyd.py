@@ -22,13 +22,18 @@ def le_meta(*reports):
 
 
 def profile(cid, nick="anon", colour=1, status="", avatar="00" * 32, rev=0):
+    key, pub = nb.new_keypair()
     return {"id": cid, "nick": nick, "colour": colour, "status": status, "avatar": avatar,
-            "rev": rev, "listen_only": False, "muted": []}
+            "rev": rev, "listen_only": False, "muted": [], "key": key, "pub": pub, "tx": 0}
 
 
 def deliver(sender, receiver, now=0.0, wall=1000.0, rssi=-50):
     """Put every packet in sender's current cycle on air to receiver; return beeps."""
     return [receiver.on_advert(p, rssi, now, wall) for p in sender.schedule(now)]
+
+
+def fragments(node):
+    return [p for p in node.out[0]] if node.out else []
 
 
 class Hci(unittest.TestCase):
@@ -106,12 +111,13 @@ class RadioSend(unittest.TestCase):
 
 
 class Packets(unittest.TestCase):
-    def test_longest_fields_fit_in_31_bytes(self):
-        me = profile("abcdef", nick="x" * 10, status="y" * 20, avatar="ff" * 32)
-        node = nb.Node(me)
-        node.met["123456"] = {"nick": "z"}
-        node.command({"cmd": "wave", "to": "123456", "text": "w" * 40}, 0)
-        for p in node.schedule(0):
+    def test_everything_fits_in_31_bytes(self):
+        a = nb.Node(profile("abcdef", nick="x" * 10, status="y" * 20, avatar="ff" * 32))
+        b = nb.Node(profile("123456"))
+        deliver(b, a)
+        self.assertEqual(a.command({"cmd": "text", "to": "123456", "text": "w" * 60}, 0), {"ok": True})
+        self.assertEqual(len(fragments(a)), 4)  # 40 characters + 16-byte tag = 56 bytes
+        for p in a.schedule(0):
             self.assertLessEqual(len(p), 31)
             self.assertEqual(len(nb.adv_params(p)), 32)
 
@@ -123,14 +129,16 @@ class Packets(unittest.TestCase):
         self.assertIsNone(nb.parse(b""))
         self.assertIsNone(nb.parse(bytes([2, 0x01, 0x06])))                        # flags only
         self.assertIsNone(nb.parse(bytes([8, 0xFF, 0x4C, 0x00, 1, 2, 3, 4, 5])))   # someone else's company id
-        self.assertIsNone(nb.parse(bytes([9, 0xFF, 0xFF, 0xFF, 0xB6, 0x11, 1, 2, 3])))  # wrong magic
-        self.assertIsNone(nb.parse(bytes([9, 0xFF, 0xFF, 0xFF, 0xB7, 0x21, 1, 2, 3])))  # future version
-        self.assertIsNone(nb.parse(bytes([5, 0xFF, 0xFF, 0xFF, 0xB7, 0x11])))      # too short
+        self.assertIsNone(nb.parse(bytes([9, 0xFF, 0xFF, 0xFF, 0xB6, 0x21, 1, 2, 3])))  # wrong magic
+        self.assertIsNone(nb.parse(bytes([9, 0xFF, 0xFF, 0xFF, 0xB7, 0x11, 1, 2, 3])))  # version 1 (Nearby 1.1)
+        self.assertIsNone(nb.parse(bytes([5, 0xFF, 0xFF, 0xFF, 0xB7, 0x21])))      # too short
 
-    def test_schedule_sends_card_most_and_interleaves_waves(self):
-        seq = nb.schedule(["C", "S", "A0", "A1"])
-        self.assertEqual(seq, ["C", "S", "C", "A0", "C", "A1"])
-        self.assertEqual(nb.schedule(["C", "S", "A0", "A1"], "W")[:4], ["C", "W", "S", "W"])
+    def test_schedule(self):
+        cards = ["C", "S", "A0", "A1", "K0", "K1"]
+        self.assertEqual(nb.schedule(cards), ["C", "S", "C", "A0", "C", "A1", "C", "K0", "C", "K1"])
+        with_text = nb.schedule(cards, ["F0", "F1", "F2", "F3"])
+        self.assertEqual(with_text[:6], ["C", "F0", "F1", "S", "F2", "F3"])
+        self.assertEqual(sum(p.startswith("F") for p in with_text), 20)  # two of every three slots
 
     def test_clean_strips_control_and_escape_codes(self):
         self.assertEqual(nb.clean(b"hi\x1b[2J\x07there\xff", 20), "hi[2Jthere")
@@ -142,34 +150,33 @@ class Swap(unittest.TestCase):
         self.a = nb.Node(profile("aaaaaa", nick="Ada", colour=2, status="hello", avatar="0f" * 32))
         self.b = nb.Node(profile("bbbbbb", nick="Bo"))
 
-    def test_full_card_arrives(self):
+    def test_full_card_and_key_arrive(self):
         deliver(self.a, self.b, wall=500.0)
         rec = self.b.met["aaaaaa"]
-        self.assertEqual((rec["nick"], rec["colour"], rec["status"], rec["avatar"]),
-                         ("Ada", 2, "hello", "0f" * 32))
+        self.assertEqual((rec["nick"], rec["colour"], rec["status"], rec["avatar"], rec["pub"]),
+                         ("Ada", 2, "hello", "0f" * 32, self.a.me["pub"]))
         self.assertEqual((rec["first"], rec["last"], rec["count"]), (500.0, 500.0, 1))
         self.assertEqual([p["nick"] for p in self.b.around(0)], ["Ada"])
 
     def test_status_before_card_is_ignored(self):
-        status = nb.card_packets(self.a.me)[1]
-        self.b.on_advert(status, -50, 0, 0)
+        self.b.on_advert(nb.card_packets(self.a.me)[1], -50, 0, 0)
         self.assertNotIn("aaaaaa", self.b.met)
 
     def test_edit_bumps_rev_and_old_parts_are_ignored(self):
         old_status = nb.card_packets(self.a.me)[1]
         deliver(self.a, self.b)
         self.a.command({"cmd": "set_card", "status": "new"}, 0)
-        self.b.on_advert(nb.card_packets(self.a.me)[0], -50, 1, 1001)  # new card (new rev)
-        self.b.on_advert(old_status, -50, 1, 1001)                       # stale status: ignored
+        self.b.on_advert(nb.card_packets(self.a.me)[0], -50, 1, 1001)
+        self.b.on_advert(old_status, -50, 1, 1001)
         self.assertEqual(self.b.met["aaaaaa"]["status"], "hello")
         self.b.on_advert(nb.card_packets(self.a.me)[1], -50, 1, 1001)
         self.assertEqual(self.b.met["aaaaaa"]["status"], "new")
 
     def test_meeting_counts(self):
         deliver(self.a, self.b, wall=0)
-        deliver(self.a, self.b, wall=60)                       # same meeting
+        deliver(self.a, self.b, wall=60)
         self.assertEqual(self.b.met["aaaaaa"]["count"], 1)
-        deliver(self.a, self.b, wall=60 + nb.NEW_MEETING + 1)  # came back later
+        deliver(self.a, self.b, wall=60 + nb.NEW_MEETING + 1)
         self.assertEqual(self.b.met["aaaaaa"]["count"], 2)
 
     def test_leaves_around_list_but_stays_met(self):
@@ -185,44 +192,170 @@ class Swap(unittest.TestCase):
         deliver(self.a, self.b, wall=1000)
         self.b.changed = False
         deliver(self.a, self.b, wall=1010)
-        self.assertFalse(self.b.changed)  # only "last seen" moved, by 10 s
+        self.assertFalse(self.b.changed)
         deliver(self.a, self.b, wall=1070)
         self.assertTrue(self.b.changed)
 
+    def test_safety_codes_match_on_both_sides(self):
+        deliver(self.a, self.b)
+        deliver(self.b, self.a)
+        code_on_a = self.a.command({"cmd": "state"}, 0)["met"][0]["code"]
+        code_on_b = self.b.command({"cmd": "state"}, 0)["met"][0]["code"]
+        self.assertEqual(code_on_a, code_on_b)
+        self.assertRegex(code_on_a, r"^\d{3} \d{3}$")
 
-class Waves(unittest.TestCase):
+    def test_private_key_never_leaves_the_service(self):
+        st = self.a.command({"cmd": "state"}, 0)
+        self.assertNotIn("key", st["me"])
+        self.assertNotIn(self.a.me["key"], json.dumps(st))
+        self.assertNotIn("key", self.a.command({"cmd": "set_card", "nick": "Ada2"}, 0)["me"])
+
+
+class Texts(unittest.TestCase):
     def setUp(self):
         self.a = nb.Node(profile("aaaaaa", nick="Ada"))
         self.b = nb.Node(profile("bbbbbb", nick="Bo"))
         deliver(self.a, self.b)
         deliver(self.b, self.a)
 
-    def test_wave_arrives_once_and_beeps_once(self):
-        self.assertEqual(self.a.command({"cmd": "wave", "to": "bbbbbb", "text": "come say hi"}, 0), {"ok": True})
-        beeps = deliver(self.a, self.b, now=1, wall=1001) + deliver(self.a, self.b, now=2, wall=1002)
+    def send(self, text="come say hi", to="bbbbbb", node=None):
+        node = node or self.a
+        self.assertEqual(node.command({"cmd": "text", "to": to, "text": text}, 0), {"ok": True})
+        return fragments(node)
+
+    def feed(self, frags, node=None, wall=2000.0):
+        node = node or self.b
+        return [node.on_advert(p, -50, 1, wall) for p in frags]
+
+    def test_text_arrives_once_and_beeps_once(self):
+        frags = self.send()
+        beeps = self.feed(frags) + self.feed(frags) + deliver(self.a, self.b, now=2)
         self.assertEqual(beeps.count(True), 1)
         self.assertEqual([(w["nick"], w["text"]) for w in self.b.waves], [("Ada", "come say hi")])
+        self.assertEqual(self.a.sent[-1]["text"], "come say hi")
 
-    def test_wave_stops_after_its_time(self):
-        self.a.command({"cmd": "wave", "to": "bbbbbb", "text": "hi"}, 0)
-        self.assertEqual(len(self.a.schedule(nb.WAVE_SECONDS + 1)), 6)
+    def test_fragments_in_any_order(self):
+        frags = self.send("x" * 40)
+        self.assertEqual(self.feed(list(reversed(frags))).count(True), 1)
+        self.assertEqual(self.b.waves[0]["text"], "x" * 40)
 
-    def test_wave_for_someone_else_ignored(self):
+    def test_missing_fragment_means_no_text_yet(self):
+        frags = self.send("x" * 40)
+        self.feed(frags[:-1])
+        self.assertEqual(self.b.waves, [])
+        self.assertEqual(self.feed(frags[-1:]).count(True), 1)
+
+    def test_ciphertext_does_not_contain_the_words(self):
+        frags = self.send("meet at the library")
+        self.assertNotIn(b"library", b"".join(frags))
+
+    def test_altered_text_is_rejected(self):
+        frags = self.send()
+        bad = bytearray(frags[0])
+        bad[-1] ^= 0x01
+        self.feed([bytes(bad)] + frags[1:])
+        self.assertEqual(self.b.waves, [])
+        self.assertEqual(self.feed(frags).count(True), 1)  # the real one still gets through afterwards
+
+    def test_replay_is_ignored(self):
+        frags = self.send()
+        self.feed(frags)
+        self.b.waves.clear()
+        self.assertEqual(self.feed(frags, wall=9999).count(True), 0)  # recorded and replayed later
+        self.assertEqual(self.b.waves, [])
+
+    def test_counter_rises_and_survives_restart(self):
+        self.send("one")
+        self.send("two")
+        self.assertEqual(self.a.me["tx"], 2)
+        self.assertTrue(self.a.urgent)  # the counter must hit the disk before the text is sent
+
+    def test_text_for_someone_else_is_unreadable_to_them(self):
         c = nb.Node(profile("cccccc", nick="Cy"))
         deliver(self.a, c)
-        self.a.command({"cmd": "wave", "to": "bbbbbb", "text": "hi"}, 0)
-        self.assertEqual(deliver(self.a, c, now=1).count(True), 0)
+        frags = self.send()
+        self.assertEqual(self.feed(frags, node=c).count(True), 0)
         self.assertEqual(c.waves, [])
+
+    def test_forged_text_from_impostor_is_rejected(self):
+        # Mallory copies Ada's card id but has her own key, so she can't make a valid text for Bo.
+        mallory = nb.Node(profile("aaaaaa", nick="Ada"))
+        deliver(self.b, mallory)
+        self.feed(self.send("send me money", node=mallory))
+        self.assertEqual(self.b.waves, [])
+
+    def test_impostor_key_is_flagged_and_texting_refused(self):
+        mallory = nb.Node(profile("aaaaaa", nick="Ada"))
+        deliver(mallory, self.b)
+        self.assertTrue(self.b.met["aaaaaa"]["impostor"])
+        self.assertEqual(self.b.met["aaaaaa"]["pub"], self.a.me["pub"])  # the first key stays pinned
+        reply = self.b.command({"cmd": "text", "to": "aaaaaa", "text": "hi"}, 0)
+        self.assertIn("copying", reply["error"])
+        self.assertFalse(self.b.command({"cmd": "state"}, 0)["met"][0]["can_text"])
+
+    def test_no_key_yet(self):
+        c = nb.Node(profile("cccccc", nick="Cy"))
+        c.on_advert(nb.card_packets(self.a.me)[0], -50, 0, 0)  # only the card arrived
+        reply = c.command({"cmd": "text", "to": "aaaaaa", "text": "hi"}, 0)
+        self.assertIn("key hasn't arrived", reply["error"])
 
     def test_muted_sender_does_not_beep(self):
         self.b.command({"cmd": "mute", "id": "aaaaaa"}, 0)
-        self.a.command({"cmd": "wave", "to": "bbbbbb", "text": "spam"}, 0)
-        self.assertEqual(deliver(self.a, self.b, now=1).count(True), 0)
+        self.assertEqual(self.feed(self.send()).count(True), 0)
+        self.assertEqual(len(self.b.waves), 1)  # still kept, just quiet
 
-    def test_listen_only_refuses_and_unknown_target_refused(self):
-        self.assertIn("error", self.a.command({"cmd": "wave", "to": "999999", "text": "x"}, 0))
+    def test_refusals(self):
+        self.assertIn("error", self.a.command({"cmd": "text", "to": "999999", "text": "x"}, 0))
+        self.assertIn("error", self.a.command({"cmd": "text", "to": "bbbbbb", "text": "   "}, 0))
         self.a.command({"cmd": "listen_only", "on": True}, 0)
-        self.assertIn("error", self.a.command({"cmd": "wave", "to": "bbbbbb", "text": "x"}, 0))
+        self.assertIn("error", self.a.command({"cmd": "text", "to": "bbbbbb", "text": "x"}, 0))
+        self.assertEqual(self.a.me["tx"], 0)  # refusals never use up a counter
+
+    def test_text_stops_after_its_time(self):
+        self.send()
+        self.assertEqual(len(self.a.schedule(nb.TEXT_SECONDS + 1)), 10)
+
+    def receipts(self, node=None):
+        node = node or self.b
+        return [p for p in node.schedule(1) if nb.parse(p)[0] == nb.ACK]
+
+    def test_receipt_stops_resending_and_marks_delivered(self):
+        self.feed(self.send())
+        acks = self.receipts()
+        self.assertTrue(acks)
+        self.assertFalse(self.a.sent[-1]["delivered"])
+        for p in acks:
+            self.a.on_advert(p, -50, 2, 2001)
+        self.assertIsNone(self.a.out)
+        self.assertTrue(self.a.sent[-1]["delivered"])
+        self.assertEqual(len(self.a.schedule(3)), 10)  # back to just the card
+
+    def test_forged_receipt_is_ignored(self):
+        self.send()
+        real_tag = nb.receipt_tag(b"\0" * 32, "aaaaaa", "bbbbbb", 1)  # wrong key: Mallory doesn't have theirs
+        fake = nb.packet(nb.ACK, bytes.fromhex("bbbbbb"), bytes.fromhex("aaaaaa") + (1).to_bytes(3, "big") + real_tag)
+        self.a.on_advert(fake, -50, 2, 2001)
+        self.assertIsNotNone(self.a.out)
+        self.assertFalse(self.a.sent[-1]["delivered"])
+
+    def test_missed_receipt_is_sent_again(self):
+        frags = self.send()
+        self.feed(frags)
+        self.b.receipts.clear()   # pretend it timed out before Ada heard it
+        self.feed(frags)           # Ada is still resending
+        self.assertTrue(self.receipts())
+
+    def test_listen_only_receiver_sends_no_receipt(self):
+        self.b.command({"cmd": "listen_only", "on": True}, 0)
+        self.feed(self.send())
+        self.assertEqual(len(self.b.waves), 1)
+        self.assertEqual(self.b.receipts, {})
+
+    def test_fragment_flood_is_bounded(self):
+        for counter in range(1, 200):
+            payload = bytes.fromhex("bbbbbb") + counter.to_bytes(3, "big") + bytes([0x02]) + b"x" * 15
+            self.b.on_advert(nb.packet(nb.TEXT, bytes.fromhex("aaaaaa"), payload), -50, 1, 2000)
+        self.assertLessEqual(len(self.b.partial), nb.PARTIAL_MAX)
 
 
 class Commands(unittest.TestCase):
@@ -232,7 +365,7 @@ class Commands(unittest.TestCase):
         self.assertIn("error", n.command({"cmd": "set_card", "colour": 8}, 0))
         self.assertIn("error", n.command({"cmd": "set_card", "colour": True}, 0))
         self.assertIn("error", n.command({"cmd": "set_card", "avatar": "zz" * 32}, 0))
-        self.assertEqual(n.me["rev"], 0)  # nothing applied
+        self.assertEqual(n.me["rev"], 0)
         r = n.command({"cmd": "set_card", "nick": "Ada\x1b[31m long name", "colour": 7,
                        "status": "s" * 50, "avatar": "AB" * 32}, 0)
         self.assertEqual((r["me"]["nick"], r["me"]["colour"], len(r["me"]["status"]), r["me"]["avatar"], r["me"]["rev"]),
@@ -251,6 +384,7 @@ class Commands(unittest.TestCase):
         self.assertEqual(len(bytes.fromhex(p["id"])), 3)
         self.assertTrue(p["nick"].startswith("anon-") and len(p["nick"]) <= nb.NICK_MAX)
         self.assertIn(p["colour"], range(nb.COLOURS))
+        self.assertEqual((len(p["key"]), len(p["pub"]), p["tx"]), (64, 64, 0))
 
 
 class Files(unittest.TestCase):
@@ -259,10 +393,28 @@ class Files(unittest.TestCase):
             n = nb.load_node(d)
             n.met["123456"] = {"nick": "Bo"}
             n.waves.append({"from": "123456", "text": "hi"})
+            n.sent.append({"to": "123456", "text": "yo"})
             nb.save_node(d, n)
             m = nb.load_node(d)
-            self.assertEqual((m.me, m.met, m.waves), (n.me, n.met, n.waves))
+            self.assertEqual((m.me, m.met, m.waves, m.sent), (n.me, n.met, n.waves, n.sent))
             self.assertFalse(any(f.endswith(".tmp") for f in os.listdir(d)))
+
+    def test_old_card_gets_a_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = profile("abcdef", nick="Ada")
+            for k in ("key", "pub", "tx"):
+                del old[k]
+            nb.save_json(os.path.join(d, "profile.json"), old)
+            me = nb.load_node(d).me
+            self.assertEqual((me["nick"], me["id"], me["tx"], len(me["pub"])), ("Ada", "abcdef", 0, 64))
+            self.assertEqual(nb.load_node(d).me["key"], me["key"])  # saved, not regenerated
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "file modes need Linux")
+    def test_files_are_owner_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            nb.save_node(d, nb.load_node(d))
+            for f in os.listdir(d):
+                self.assertEqual(os.stat(os.path.join(d, f)).st_mode & 0o777, 0o600, f)
 
 
 @unittest.skipUnless(hasattr(socket, "AF_UNIX") and sys.platform != "win32", "needs Unix sockets")

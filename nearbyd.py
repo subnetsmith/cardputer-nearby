@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """nearbyd: the Nearby background service.
 
-Sends your profile card (nickname, colour, status, 16x16 avatar) over Bluetooth
-LE and collects the cards of other CardputerZeros running Nearby. A wave sent
-to you beeps. It drives the Bluetooth chip directly over a raw HCI socket:
-Linux, CAP_NET_RAW (or root), standard library only. The Nearby app and the
-`nearbyd status|card|wave|listen` commands talk to it over a Unix socket.
+Sends your profile card (nickname, colour, status, 16x16 avatar, public key)
+over Bluetooth LE and collects the cards of other CardputerZeros running
+Nearby. Texts between two people are end-to-end encrypted (X25519 +
+ChaCha20-Poly1305 from the `cryptography` package); a text for you beeps.
+It drives the Bluetooth chip directly over a raw HCI socket: Linux and
+CAP_NET_RAW (or root). The Nearby app and the
+`nearbyd status|card|text|listen` commands talk to it over a Unix socket.
 """
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -22,23 +26,33 @@ import tempfile
 import time
 import wave
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
 # ---------- beacon format ----------
 # One manufacturer-data AD structure per advert:
 #   FF FF | B7 | version<<4 | kind | card id (3) | payload (<= 22)
 # 0xFFFF is the Bluetooth SIG company id reserved for testing, so no company owns it.
 COMPANY = b"\xff\xff"
 MAGIC = 0xB7
-VERSION = 1
-CARD, STATUS, AVATAR0, AVATAR1, WAVE = 1, 2, 3, 4, 5
-NICK_MAX, STATUS_MAX, WAVE_MAX = 10, 20, 18
+VERSION = 2  # 2 added public keys and encrypted texts; version 1 devices are ignored
+CARD, STATUS, AVATAR0, AVATAR1, TEXT, KEY0, KEY1, ACK = 1, 2, 3, 4, 5, 6, 7, 8
+NICK_MAX, STATUS_MAX, TEXT_MAX = 10, 20, 40
 COLOURS = 8
 AVATAR_BYTES = 32  # 16x16 pixels, 1 bit each
+# A text fragment: to (3) | counter (3) | index<<4 | count | ciphertext chunk
+FRAG = 22 - 7
+PARTIAL_MAX = 32   # half-received texts kept at once (bounds memory if someone floods fragments)
 
 ROTATE_SECONDS = 15 * 60  # new random radio address this often
 SLOT = 0.5                # seconds each packet is on air before the next one
 LOST_AFTER = 30.0         # off the "around" list after this long unheard (reception has long gaps)
 NEW_MEETING = 30 * 60     # seen again after this long counts as meeting again
-WAVE_SECONDS = 20.0       # keep sending a wave this long (reception drops packets)
+TEXT_SECONDS = 120.0      # keep resending a text until its receipt arrives, at most this long
+ACK_SECONDS = 30.0        # keep sending a receipt this long
 # Another app using the radio raw can switch our scanning or advertising off.
 QUIET_RESTART = 20.0      # heard no adverts at all this long: restart the radio
 REASSERT = 30.0           # switch advertising back on this often
@@ -160,49 +174,116 @@ def parse(data):
 
 def card_packets(me):
     cid, rev = bytes.fromhex(me["id"]), bytes([me["rev"]])
-    av = bytes.fromhex(me["avatar"])
+    av, pub = bytes.fromhex(me["avatar"]), bytes.fromhex(me["pub"])
     return [packet(CARD, cid, rev + bytes([me["colour"]]) + me["nick"].encode()),
             packet(STATUS, cid, rev + me["status"].encode()),
             packet(AVATAR0, cid, rev + av[:16]),
-            packet(AVATAR1, cid, rev + av[16:])]
+            packet(AVATAR1, cid, rev + av[16:]),
+            packet(KEY0, cid, pub[:16]),
+            packet(KEY1, cid, pub[16:])]
 
 
-def wave_packet(me, to_id, wave_id, text):
-    return packet(WAVE, bytes.fromhex(me["id"]), bytes.fromhex(to_id) + bytes([wave_id]) + text.encode())
+def schedule(cards, text=()):
+    """One send cycle. The card goes out most often because it carries the name.
+    While a text or receipts are going out, two of every three slots carry them."""
+    c, s, a0, a1, k0, k1 = cards
+    seq = [c, s, c, a0, c, a1, c, k0, c, k1]
+    if not text:
+        return seq
+    out, n = [], 0
+    for p in seq:
+        out += [p, text[n % len(text)], text[(n + 1) % len(text)]]
+        n += 2
+    return out
 
 
-def schedule(cards, wave_pkt=None):
-    """One send cycle. The card goes out most often because it carries the name."""
-    c, s, a0, a1 = cards
-    seq = [c, s, c, a0, c, a1]
-    return [p for x in seq for p in (x, wave_pkt)] if wave_pkt else seq
+# ---------- encryption ----------
+# Each pair of people shares one key: X25519 between their card keys, through HKDF.
+# A text's nonce is sender id | recipient id | the sender's text counter, which never
+# repeats (it is saved before the text goes on air), so no nonce is ever reused.
+
+def new_keypair():
+    k = X25519PrivateKey.generate()
+    return k.private_bytes_raw().hex(), k.public_key().public_bytes_raw().hex()
+
+
+def pair_key(my_key_hex, my_pub_hex, their_pub_hex):
+    """The shared 32-byte key for this pair, the same from both sides. ValueError for a bad key."""
+    shared = X25519PrivateKey.from_private_bytes(bytes.fromhex(my_key_hex)).exchange(
+        X25519PublicKey.from_public_bytes(bytes.fromhex(their_pub_hex)))
+    lo, hi = sorted([bytes.fromhex(my_pub_hex), bytes.fromhex(their_pub_hex)])
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"nearby text v2" + lo + hi).derive(shared)
+
+
+def safety_code(pub_a_hex, pub_b_hex):
+    """Six digits both people see the same; compare them in person to rule out a faked card."""
+    lo, hi = sorted([bytes.fromhex(pub_a_hex), bytes.fromhex(pub_b_hex)])
+    n = int.from_bytes(hashlib.sha256(b"nearby safety" + lo + hi).digest()[:4], "big") % 1_000_000
+    return f"{n // 1000:03d} {n % 1000:03d}"
+
+
+def _header(sender_hex, to_hex, counter):
+    return bytes.fromhex(sender_hex) + bytes.fromhex(to_hex) + counter.to_bytes(3, "big")
+
+
+def text_packets(me, to_hex, counter, text, key):
+    """Encrypt a text and cut it into beacon fragments."""
+    head = _header(me["id"], to_hex, counter)
+    ct = ChaCha20Poly1305(key).encrypt(head + b"\0\0\0", text.encode(), b"nearby2" + head)
+    chunks = [ct[i:i + FRAG] for i in range(0, len(ct), FRAG)]
+    return [packet(TEXT, bytes.fromhex(me["id"]), head[3:] + bytes([i << 4 | len(chunks)]) + c)
+            for i, c in enumerate(chunks)]
+
+
+def receipt_tag(key, sender_hex, to_hex, counter):
+    """8 bytes only the two people in this chat can make: a receipt nobody else can fake."""
+    return hmac.new(key, b"nearby ack" + _header(sender_hex, to_hex, counter), hashlib.sha256).digest()[:8]
+
+
+def receipt_packet(me, sender_hex, counter, key):
+    """Sent by the receiver of a text: "I have text <counter> from <sender>"."""
+    return packet(ACK, bytes.fromhex(me["id"]), bytes.fromhex(sender_hex) + counter.to_bytes(3, "big")
+                  + receipt_tag(key, sender_hex, me["id"], counter))
+
+
+def open_text(key, sender_hex, to_hex, counter, ct):
+    """The text, or None if it was altered or isn't for this key."""
+    head = _header(sender_hex, to_hex, counter)
+    try:
+        return ChaCha20Poly1305(key).decrypt(head + b"\0\0\0", ct, b"nearby2" + head)
+    except InvalidTag:
+        return None
 
 
 # ---------- state ----------
 
 def new_profile():
     cid = secrets.token_hex(3)
+    key, pub = new_keypair()
     return {"id": cid, "nick": "anon-" + cid[:4], "colour": secrets.randbelow(COLOURS),
             "status": "", "avatar": "00" * AVATAR_BYTES, "rev": 0,
-            "listen_only": False, "muted": []}
+            "listen_only": False, "muted": [], "key": key, "pub": pub, "tx": 0}
 
 
 class Node:
     """Everything except the radio and sockets, so it can be tested on any machine."""
 
-    def __init__(self, me, met=None, waves=None):
+    def __init__(self, me, met=None, waves=None, sent=None):
         self.me = me
-        self.met = met or {}      # card id -> {nick, colour, status, avatar, rev, first, last, count}
-        self.waves = waves or []  # newest last: {from, nick, text, time, wid}
+        self.met = met or {}      # card id -> {nick, colour, status, avatar, rev, first, last, count, pub, rx}
+        self.waves = waves or []  # texts received, newest last: {from, nick, text, time, wid}
+        self.sent = sent or []    # texts sent, newest last: {to, nick, text, time}
         self.heard = {}           # card id -> {"last": monotonic, "rssi": [...]}
-        self.out = None           # (packet, until) for a wave being sent
-        self.wave_id = secrets.randbelow(256)
+        self.partial = {}         # (sender, counter) -> {"n", "parts", "t"}: texts still arriving
+        self.out = None           # (fragments, until, to, counter) for the text being sent
+        self.receipts = {}        # (sender, counter) -> (packet, until): receipts we are sending
         self.changed = False
+        self.urgent = False       # save before anything else goes on air (the text counter)
 
     # --- radio side ---
 
     def on_advert(self, data, rssi, now, wall):
-        """Feed one received advert. Returns True when a wave for us arrived (beep)."""
+        """Feed one received advert. Returns True when a text for us arrived (beep)."""
         p = parse(data)
         if not p or p[1] == self.me["id"]:
             return False
@@ -221,7 +302,7 @@ class Node:
                 rec["count"] += 1
             rec.update(nick=nick, colour=colour, rev=rev)
         if rec is None:
-            return False  # status, avatar and waves only count once we have the card
+            return False  # status, avatar, key and texts only count once we have the card
         rec["last"] = wall
         try:
             if kind == STATUS and payload[:1] == bytes([rec["rev"]]):
@@ -230,58 +311,134 @@ class Node:
                 av = bytearray.fromhex(rec["avatar"])
                 av[(kind - AVATAR0) * 16:(kind - AVATAR0 + 1) * 16] = payload[1:]
                 rec["avatar"] = av.hex()
-            elif kind == WAVE and len(payload) >= 4 and payload[:3].hex() == self.me["id"]:
-                self.changed = True
-                return self._got_wave(sender, rec, payload[3], clean(payload[4:], WAVE_MAX), wall)
+            elif kind in (KEY0, KEY1) and len(payload) == 16:
+                self._got_key_half(rec, kind - KEY0, payload.hex())
+            elif kind == ACK and len(payload) == 14 and payload[:3].hex() == self.me["id"]:
+                self._got_receipt(sender, rec, int.from_bytes(payload[3:6], "big"), payload[6:])
+            elif kind == TEXT and len(payload) > 7 and payload[:3].hex() == self.me["id"]:
+                return self._got_fragment(sender, rec, payload, now, wall)
             return False
         finally:
             # Save when something real changed, or "last seen" moved a minute: spares the SD card.
-            if before is None or any(before[k] != rec[k] for k in rec if k != "last") \
+            if before is None or any(before.get(k) != rec[k] for k in rec if k != "last") \
                     or wall - before["last"] >= 60:
                 self.changed = True
 
-    def _got_wave(self, sender, rec, wid, text, wall):
-        # A wave repeats for WAVE_SECONDS, so the same one arrives many times.
-        if any(w["from"] == sender and w["wid"] == wid and wall - w["time"] < 2 * WAVE_SECONDS
-               for w in self.waves):
+    def _got_key_half(self, rec, half, hexpart):
+        if rec.get("pub"):
+            # The first key seen for a card is pinned. A real card's key never changes,
+            # so a different one means someone is copying this card id.
+            if rec["pub"][half * 32:(half + 1) * 32] != hexpart:
+                rec["impostor"] = True
+            return
+        parts = rec.setdefault("pubparts", ["", ""])
+        parts[half] = hexpart
+        if all(parts):
+            try:
+                X25519PublicKey.from_public_bytes(bytes.fromhex(parts[0] + parts[1]))
+                rec["pub"] = parts[0] + parts[1]
+            except ValueError:
+                pass
+            del rec["pubparts"]
+
+    def _got_fragment(self, sender, rec, payload, now, wall):
+        counter = int.from_bytes(payload[3:6], "big")
+        idx, n = payload[6] >> 4, payload[6] & 0x0F
+        if not n or idx >= n:
             return False
-        self.waves = (self.waves + [{"from": sender, "nick": rec["nick"], "text": text,
-                                     "time": wall, "wid": wid}])[-INBOX_MAX:]
+        if counter <= rec.get("rx", 0):
+            # Already have it (replays land here too). If it's the latest, they may have missed
+            # our receipt, so keep sending one.
+            if counter == rec.get("rx") and rec.get("pub"):
+                self._send_receipt(sender, rec, counter, now)
+            return False
+        slot = self.partial.get((sender, counter))
+        if slot is None or slot["n"] != n:
+            if len(self.partial) >= PARTIAL_MAX:
+                del self.partial[min(self.partial, key=lambda k: self.partial[k]["t"])]
+            slot = self.partial[(sender, counter)] = {"n": n, "parts": {}, "t": now}
+        slot["parts"][idx] = bytes(payload[7:])
+        if len(slot["parts"]) < n:
+            return False
+        del self.partial[(sender, counter)]
+        if not rec.get("pub"):
+            return False  # can't check it without their key; they keep resending, so try again later
+        try:
+            key = pair_key(self.me["key"], self.me["pub"], rec["pub"])
+        except ValueError:
+            return False
+        plain = open_text(key, sender, self.me["id"], counter, b"".join(slot["parts"][i] for i in range(n)))
+        if plain is None:
+            return False  # altered, or forged by someone without their key
+        rec["rx"] = counter
+        self._send_receipt(sender, rec, counter, now)
+        self.changed = True
+        self.waves = (self.waves + [{"from": sender, "nick": rec["nick"], "time": wall, "wid": counter,
+                                     "text": clean(plain.decode("utf-8", "replace"), TEXT_MAX)}])[-INBOX_MAX:]
         return sender not in self.me["muted"]
+
+    def _send_receipt(self, sender, rec, counter, now):
+        try:
+            key = pair_key(self.me["key"], self.me["pub"], rec["pub"])
+        except ValueError:
+            return
+        if not self.me["listen_only"]:
+            self.receipts[(sender, counter)] = (receipt_packet(self.me, sender, counter, key), now + ACK_SECONDS)
+
+    def _got_receipt(self, sender, rec, counter, tag):
+        if not self.out or self.out[2] != sender or self.out[3] != counter or not rec.get("pub"):
+            return
+        try:
+            key = pair_key(self.me["key"], self.me["pub"], rec["pub"])
+        except ValueError:
+            return
+        if hmac.compare_digest(tag, receipt_tag(key, self.me["id"], sender, counter)):
+            self.out = None  # delivered: stop resending
+            for s in self.sent:
+                if s["to"] == sender and s.get("counter") == counter:
+                    s["delivered"] = True
+            self.changed = True
 
     def schedule(self, now):
         if self.out and now >= self.out[1]:
             self.out = None
-        return schedule(card_packets(self.me), self.out[0] if self.out else None)
+        for k in [k for k, v in self.partial.items() if now - v["t"] > 2 * TEXT_SECONDS]:
+            del self.partial[k]
+        self.receipts = {k: v for k, v in self.receipts.items() if now < v[1]}
+        extra = (list(self.out[0]) if self.out else []) + [v[0] for v in self.receipts.values()]
+        return schedule(card_packets(self.me), extra)
 
     def around(self, now):
         """People heard in the last LOST_AFTER seconds, strongest signal first."""
         out = []
         for cid, h in self.heard.items():
             if cid in self.met and now - h["last"] <= LOST_AFTER:
-                out.append(dict(self.met[cid], id=cid, rssi=sum(h["rssi"]) // len(h["rssi"])))
+                out.append(dict(self._public(cid), rssi=sum(h["rssi"]) // len(h["rssi"])))
         return sorted(out, key=lambda p: -p["rssi"])
+
+    def _public(self, cid):
+        """A met person as the app sees it, with the safety code once their key is known."""
+        r = self.met[cid]
+        out = {k: v for k, v in r.items() if k not in ("pubparts", "rx")}
+        out.update(id=cid, impostor=bool(r.get("impostor")), can_text=bool(r.get("pub")) and not r.get("impostor"))
+        if r.get("pub"):
+            out["code"] = safety_code(self.me["pub"], r["pub"])
+        return out
 
     # --- app side ---
 
     def command(self, req, now):
         cmd = req.get("cmd")
         if cmd == "state":
-            met = sorted((dict(r, id=k) for k, r in self.met.items()), key=lambda r: -r["last"])
-            return {"me": self.me, "around": self.around(now), "met": met,
-                    "waves": self.waves, "sending": self.out is not None}
+            met = sorted((self._public(k) for k in self.met), key=lambda r: -r["last"])
+            me = {k: v for k, v in self.me.items() if k != "key"}  # the private key never leaves the service
+            return {"me": me, "around": self.around(now), "met": met,
+                    "waves": self.waves, "sent": self.sent, "sending": self.out is not None}
         if cmd == "set_card":
             return self._set_card(req)
-        if cmd == "wave":
-            to, text = str(req.get("to", "")), clean(str(req.get("text", "")), WAVE_MAX)
-            if self.me["listen_only"]:
-                return {"error": "listen-only is on, so nothing is sent"}
-            if to not in self.met:
-                return {"error": "unknown card id"}
-            self.wave_id = (self.wave_id + 1) % 256
-            self.out = (wave_packet(self.me, to, self.wave_id, text), now + WAVE_SECONDS)
-            return {"ok": True}
-        if cmd == "waves_read":  # the app opened the Waves tab: everything up to now is read
+        if cmd == "text":
+            return self._text(str(req.get("to", "")), clean(str(req.get("text", "")), TEXT_MAX), now)
+        if cmd == "waves_read":  # the app opened the Texts tab: everything up to now is read
             self.me["waves_read"] = max([w["time"] for w in self.waves], default=0)
             self.changed = True
             return {"ok": True}
@@ -296,6 +453,31 @@ class Node:
             self.changed = True
             return {"ok": True}
         return {"error": f"unknown command {cmd!r}"}
+
+    def _text(self, to, text, now):
+        rec = self.met.get(to)
+        if self.me["listen_only"]:
+            return {"error": "listen-only is on, so nothing is sent"}
+        if rec is None:
+            return {"error": "unknown card id"}
+        if rec.get("impostor"):
+            return {"error": f"someone is copying {rec['nick']}'s card, so texting isn't safe"}
+        if not rec.get("pub"):
+            return {"error": f"{rec['nick']}'s key hasn't arrived yet: stay close a few seconds"}
+        if not text.strip():
+            return {"error": "type something first"}
+        try:
+            key = pair_key(self.me["key"], self.me["pub"], rec["pub"])
+        except ValueError:
+            return {"error": f"{rec['nick']}'s key is invalid"}
+        if self.me.get("tx", 0) + 1 >= 1 << 24:
+            return {"error": "text counter used up: reset your card"}  # never wrap: a nonce must not repeat
+        self.me["tx"] = self.me.get("tx", 0) + 1
+        self.out = (text_packets(self.me, to, self.me["tx"], text, key), now + TEXT_SECONDS, to, self.me["tx"])
+        self.sent = (self.sent + [{"to": to, "nick": rec["nick"], "text": text, "time": time.time(),
+                                   "counter": self.me["tx"], "delivered": False}])[-INBOX_MAX:]
+        self.changed = self.urgent = True
+        return {"ok": True}
 
     def _set_card(self, req):
         new = dict(self.me)
@@ -317,7 +499,7 @@ class Node:
         new["rev"] = (self.me["rev"] + 1) % 256  # tells others their copy is out of date
         self.me = new
         self.changed = True
-        return {"ok": True, "me": self.me}
+        return {"ok": True, "me": {k: v for k, v in self.me.items() if k != "key"}}
 
 
 # ---------- files ----------
@@ -342,8 +524,11 @@ def load_json(path, default):
 
 def save_json(path, value):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # 0600: profile.json holds the private key. fsync: the text counter must survive a power cut.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
         json.dump(value, f)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)  # atomic: a power cut never leaves half a file
 
 
@@ -353,14 +538,19 @@ def load_node(folder):
     if me is None:
         me = new_profile()
         save_json(os.path.join(folder, "profile.json"), me)
+    elif "key" not in me:  # a 1.1 card: add a key pair, keep everything else
+        me["key"], me["pub"] = new_keypair()
+        me["tx"] = 0
+        save_json(os.path.join(folder, "profile.json"), me)
     return Node(me, load_json(os.path.join(folder, "met.json"), {}),
-                load_json(os.path.join(folder, "waves.json"), []))
+                load_json(os.path.join(folder, "waves.json"), []),
+                load_json(os.path.join(folder, "sent.json"), []))
 
 
 def save_node(folder, node):
-    for name, value in (("profile", node.me), ("met", node.met), ("waves", node.waves)):
+    for name, value in (("profile", node.me), ("met", node.met), ("waves", node.waves), ("sent", node.sent)):
         save_json(os.path.join(folder, name + ".json"), value)
-    node.changed = False
+    node.changed = node.urgent = False
 
 
 # ---------- sound ----------
@@ -518,9 +708,10 @@ def serve(dev, quiet):
                         beep(sound)
             if server in ready:
                 answer(server, node, now)
-            if node.changed and now >= save_at:
+            if node.urgent or (node.changed and now >= save_at):
+                # urgent: a text's counter is saved before any of its fragments go on air
                 save_node(folder, node)
-                save_at = now + 5  # at most every 5 s: spares the SD card
+                save_at = now + 5  # otherwise at most every 5 s: spares the SD card
     finally:
         radio.stop()
         save_node(folder, node)
@@ -563,10 +754,14 @@ def show_status(state, wall):
         print(f"  {p['nick']:<10} {p['rssi']:>4} dBm  \"{p['status']}\"")
     print(f"Met: {len(state['met'])}")
     for p in state["met"]:
-        print(f"  {p['nick']:<10} x{p['count']:<3} last {ago(wall - p['last'])}  card {p['id']}")
-    print(f"Waves: {len(state['waves'])}")
+        key = "IMPOSTOR?" if p["impostor"] else f"code {p['code']}" if p.get("code") else "no key yet"
+        print(f"  {p['nick']:<10} x{p['count']:<3} last {ago(wall - p['last'])}  card {p['id']}  {key}")
+    print(f"Texts in: {len(state['waves'])}")
     for w in state["waves"][-5:]:
         print(f"  from {w['nick']}: \"{w['text']}\" ({ago(wall - w['time'])})")
+    for w in state["sent"][-3:]:
+        print(f"  to {w['nick']}: \"{w['text']}\" ({ago(wall - w['time'])}, "
+              + ("delivered)" if w.get("delivered") else "not delivered yet)"))
 
 
 def _stop(*_):
@@ -581,15 +776,15 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run", help="run the service")
     run.add_argument("--hci", type=int, default=0, help="Bluetooth adapter number (default 0)")
-    run.add_argument("--quiet", action="store_true", help="no beep for waves")
-    sub.add_parser("status", help="show your card, who is around, who you met, waves")
+    run.add_argument("--quiet", action="store_true", help="no beep for texts")
+    sub.add_parser("status", help="show your card, who is around, who you met, texts")
     card = sub.add_parser("card", help="change your card")
     card.add_argument("--nick")
     card.add_argument("--colour", type=int)
     card.add_argument("--status")
-    wv = sub.add_parser("wave", help="wave at someone you have met")
-    wv.add_argument("nick")
-    wv.add_argument("text", nargs="?", default="")
+    tx = sub.add_parser("text", help="send an encrypted text to someone you have met")
+    tx.add_argument("nick")
+    tx.add_argument("text")
     lo = sub.add_parser("listen", help="listen-only on/off (on = send nothing)")
     lo.add_argument("on", choices=["on", "off"])
     args = ap.parse_args(argv)
@@ -621,12 +816,12 @@ def main(argv=None):
             req = {k: v for k, v in (("nick", args.nick), ("colour", args.colour), ("status", args.status))
                    if v is not None}
             reply = ask(dict(req, cmd="set_card"))
-        elif args.cmd == "wave":
+        elif args.cmd == "text":
             met = ask({"cmd": "state"})["met"]
             match = [p["id"] for p in met if p["nick"].lower() == args.nick.lower() or p["id"] == args.nick]
             if len(match) != 1:
                 sys.exit(f"No single person called {args.nick!r} in your Met list.")
-            reply = ask({"cmd": "wave", "to": match[0], "text": args.text})
+            reply = ask({"cmd": "text", "to": match[0], "text": args.text})
         else:
             reply = ask({"cmd": "listen_only", "on": args.on == "on"})
     except (FileNotFoundError, ConnectionRefusedError):

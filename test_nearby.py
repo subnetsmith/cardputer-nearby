@@ -172,15 +172,15 @@ class Waving(unittest.TestCase):
         self.assertEqual((app.view, app.text), ("around", "hi 1q"))
         app.key(ui.KEY_BACKSPACE, None, 0)
         app.key(ui.KEY_ENTER, None, 1)
-        self.assertIn({"cmd": "wave", "to": "mo", "text": "hi 1"}, svc.calls)
+        self.assertIn({"cmd": "text", "to": "mo", "text": "hi 1"}, svc.calls)
         self.assertIsNone(app.mode)
-        self.assertIn("Waving at Mo", app.toast[0])
+        self.assertIn("Sending to Mo", app.toast[0])
 
     def test_wave_text_capped(self):
         app = started(FakeService(around=[person("Mo")]))
         app.key(ui.KEY_W, "w", 0)
-        type_text(app, "a" * 30)
-        self.assertEqual(len(app.text), 18)
+        type_text(app, "a" * 50)
+        self.assertEqual(len(app.text), 40)
 
     def test_wave_error_keeps_composer_open(self):
         svc = FakeService(around=[person("Mo")])
@@ -357,7 +357,7 @@ class WaveEsc(unittest.TestCase):
         app.key(ui.KEY_ESC, None, 0)
         app.key(ui.KEY_ESC, None, 0)
         self.assertIsNone(app.mode)
-        self.assertFalse(any(c["cmd"] == "wave" for c in svc.calls))
+        self.assertFalse(any(c["cmd"] == "text" for c in svc.calls))
 
 
 class Screens(unittest.TestCase):

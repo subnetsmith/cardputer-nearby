@@ -290,13 +290,13 @@ class App:
                       "Listen-only on: you're hidden" if on else "Listen-only off: others can see you")
 
     def _typing(self, code, ch, now):
-        limit = {"wave": nearbyd.WAVE_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[self.mode]
+        limit = {"wave": nearbyd.TEXT_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[self.mode]
         if code == KEY_BACKSPACE:
             self.text = self.text[:-1]
         elif code == KEY_ENTER:
             if self.mode == "wave":
                 p = self.target
-                if self.call({"cmd": "wave", "to": p["id"], "text": self.text}, now, f"Waving at {p['nick']} for 20 s"):
+                if self.call({"cmd": "text", "to": p["id"], "text": self.text}, now, f"Sending to {p['nick']} (encrypted)"):
                     self.mode = None
             else:
                 self._save_card(now)
@@ -519,7 +519,7 @@ def draw_me(img, d, app):
 
 
 def draw_typing(d, app):
-    limit = {"wave": nearbyd.WAVE_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[app.mode]
+    limit = {"wave": nearbyd.TEXT_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[app.mode]
     title = {"wave": f"Wave at {app.target['nick']}" if app.mode == "wave" else "",
              "nick": "Your nickname", "status": "Your status"}[app.mode]
     panel(d, 34, 136)
