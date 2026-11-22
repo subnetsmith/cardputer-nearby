@@ -1,18 +1,28 @@
 {
   "package_name": "nearby",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "app_name": "Nearby",
   "bin_name": "nearby",
-  "description": "Swap profile cards and wave at CardputerZeros close by",
+  "description": "Swap profile cards and send encrypted texts to CardputerZeros close by",
   "store": {
-    "summary": "Swap profile cards with Cardputers you pass, and wave at them",
-    "description": "Your CardputerZero carries a small profile card: a nickname, a colour, a status line and a 16x16 avatar you draw on the keyboard. Walk past anyone else running Nearby and you swap cards automatically, even with the app closed and the Cardputer in your pocket.\n\nAround shows who is in range right now, with signal bars. Met is your collection of everyone you have swapped with. Pick someone and wave at them with a short message; their Cardputer beeps and shows it.\n\nEverything is sent in the open over Bluetooth LE: anyone nearby running Nearby can read your card and waves. The radio address changes every 15 minutes, and a listen-only switch hides you completely. Mute anyone who spams.\n\nKeys: 1-4 tabs, F/X up and down, Z/C left and right, Enter to wave or edit, M to mute, Esc to leave. The background service runs as your user with one Bluetooth permission, not as root. Source code is linked below.",
-    "categories": ["Radio & Comms", "Lifestyle"],
-    "screenshots": ["screenshots/screenshot-0.png", "screenshots/screenshot-1.png", "screenshots/screenshot-2.png"],
+    "summary": "Swap cards with Cardputers you pass, and text them privately",
+    "description": "Your CardputerZero carries a small profile card: a nickname, a colour, a status line and a 16x16 avatar you draw on the keyboard. Walk past anyone else running Nearby and you swap cards automatically.\n\nAround shows who is in range right now, with signal bars. Met is your collection of everyone you have swapped with. Texts lets you send short messages (40 characters) to anyone you have met. Texts are end-to-end encrypted (X25519 + ChaCha20-Poly1305): only the person you text can read them, and a tick shows when they arrived. Compare the 6-digit safety code in person once to be sure nobody faked a card; a copied card is flagged and blocked.\n\nCards are public, and people nearby can see who you text (not what). Listen-only hides you completely. Background off saves memory: Nearby then only runs while the app is open.\n\nKeys: 1-4 tabs, F/X up and down, Z/C left and right, Enter to text or edit, M to mute, Esc to leave. The service runs as your user with one Bluetooth permission, not as root. Source code is linked below.",
+    "categories": [
+      "Radio & Comms",
+      "Security"
+    ],
+    "screenshots": [
+      "screenshots/screenshot-0.png",
+      "screenshots/screenshot-1.png",
+      "screenshots/screenshot-2.png"
+    ],
     "icon": "packaging/icon.png",
     "license": "MIT",
     "source_repo": "https://github.com/subnetsmith/cardputer-nearby",
-    "author": { "github": "subnetsmith", "display_name": "subnetsmith" },
+    "author": {
+      "github": "subnetsmith",
+      "display_name": "subnetsmith"
+    },
     "share_code": "NRBY",
     "permissions": {
       "camera": false,

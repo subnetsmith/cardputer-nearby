@@ -7,9 +7,10 @@ import nearby as ui
 WALL = 1_000_000.0
 
 
-def person(nick, colour=0, status="", rssi=-60, count=1, last=0, avatar="00" * 32):
+def person(nick, colour=0, status="", rssi=-60, count=1, last=0, avatar="00" * 32, can_text=True, impostor=False):
     return {"id": nick.lower(), "nick": nick, "colour": colour, "status": status, "avatar": avatar,
-            "rssi": rssi, "count": count, "last": WALL - last, "rev": 0, "first": 0}
+            "rssi": rssi, "count": count, "last": WALL - last, "rev": 0, "first": 0,
+            "can_text": can_text, "impostor": impostor, "code": "123 456"}
 
 
 def me(**kw):
@@ -24,7 +25,7 @@ class FakeService:
 
     def __init__(self, around=(), met=None, waves=(), **me_kw):
         self.state = {"me": me(**me_kw), "around": list(around),
-                      "met": list(around) if met is None else list(met), "waves": list(waves)}
+                      "met": list(around) if met is None else list(met), "waves": list(waves), "sent": []}
         self.calls = []
         self.fail = None
 
@@ -41,6 +42,12 @@ class FakeService:
             m["muted"].append(req["id"])
         elif req["cmd"] == "unmute":
             m["muted"].remove(req["id"])
+        elif req["cmd"] == "background":
+            m["background"] = req["on"]
+        elif req["cmd"] == "text":
+            nick = next(p["nick"] for p in self.state["met"] if p["id"] == req["to"])
+            self.state["sent"].append({"to": req["to"], "nick": nick, "text": req["text"], "time": WALL,
+                                       "delivered": False})
         elif req["cmd"] == "waves_read":
             m["waves_read"] = max([w["time"] for w in self.state["waves"]], default=0)
         return self.state if req["cmd"] == "state" else {"ok": True}
@@ -167,7 +174,7 @@ class Waving(unittest.TestCase):
         svc = FakeService(around=[person("Mo")])
         app = started(svc)
         app.key(ui.KEY_ENTER, None, 0)
-        self.assertEqual(app.mode, "wave")
+        self.assertEqual(app.mode, "text")
         type_text(app, "hi 1q")       # digits and q type while typing: no tab switch, no quit
         self.assertEqual((app.view, app.text), ("around", "hi 1q"))
         app.key(ui.KEY_BACKSPACE, None, 0)
@@ -188,7 +195,7 @@ class Waving(unittest.TestCase):
         app.key(ui.KEY_ENTER, None, 0)
         svc.fail = "listen-only is on, so nothing is sent"
         app.key(ui.KEY_ENTER, None, 0)
-        self.assertEqual(app.mode, "wave")
+        self.assertEqual(app.mode, "text")
         self.assertIn("listen-only", app.toast[0])
 
     def test_esc_cancels_composer_without_quitting(self):
@@ -204,6 +211,52 @@ class Waving(unittest.TestCase):
         self.assertEqual(svc.state["me"]["muted"], ["mo"])
         app.key(ui.KEY_M, "m", 0)
         self.assertEqual(svc.state["me"]["muted"], [])
+
+
+class TextRules(unittest.TestCase):
+    def test_no_key_yet_shows_why(self):
+        app = started(FakeService(around=[person("Mo", can_text=False)]))
+        app.key(ui.KEY_ENTER, None, 0)
+        self.assertIsNone(app.mode)
+        self.assertIn("key hasn't arrived", app.toast[0])
+
+    def test_impostor_blocks_texting(self):
+        svc = FakeService(around=[person("Mo", can_text=False, impostor=True)])
+        app = started(svc)
+        app.key(ui.KEY_ENTER, None, 0)
+        self.assertIsNone(app.mode)
+        self.assertIn("copying", app.toast[0])
+        self.assertEqual(ui.render(app, WALL).size, (ui.W, ui.H))  # the warning row draws
+
+    def test_reply_from_texts_tab(self):
+        wave = {"from": "mo", "nick": "Mo", "text": "where are you", "time": 10, "wid": 1}
+        svc = FakeService(met=[person("Mo")], waves=[wave])
+        app = started(svc, "texts")
+        app.key(ui.KEY_ENTER, None, 0)
+        self.assertEqual((app.mode, app.target["id"]), ("text", "mo"))
+        type_text(app, "library")
+        app.key(ui.KEY_ENTER, None, 0)
+        self.assertIn({"cmd": "text", "to": "mo", "text": "library"}, svc.calls)
+        self.assertEqual([(t["dir"], t["text"]) for t in app.items()], [("out", "library"), ("in", "where are you")])
+
+    def test_mute_from_texts_tab_mutes_the_other_person(self):
+        svc = FakeService(met=[person("Mo")])
+        app = started(svc, "texts")
+        svc.state["sent"].append({"to": "mo", "nick": "Mo", "text": "hi", "time": 5, "delivered": True})
+        app.refresh(0)
+        app.key(ui.KEY_M, "m", 0)
+        self.assertEqual(svc.state["me"]["muted"], ["mo"])
+
+    def test_texts_screen_draws_all_states(self):
+        svc = FakeService(met=[person("Mo")])
+        svc.state["waves"].append({"from": "mo", "nick": "Mo", "text": "x" * 40, "time": WALL - 5, "wid": 1})
+        for delivered, age in ((True, 5), (False, 5), (False, 999)):
+            svc.state["sent"].append({"to": "mo", "nick": "Mo", "text": "hello there", "time": WALL - age,
+                                      "delivered": delivered})
+        app = started(svc, "texts")
+        for sel in range(4):
+            app.sel = sel
+            self.assertEqual(ui.render(app, WALL).size, (ui.W, ui.H))
 
 
 class Inbox(unittest.TestCase):
@@ -232,9 +285,10 @@ class Inbox(unittest.TestCase):
         svc = FakeService(met=[person("Mo")], waves=[self.wave("mo", 10), self.wave("mo", 20)])
         app = started(svc)
         self.assertEqual(app.unread(), 2)
-        app.key(ui.KEY_1 + ui.TABS.index("waves"), None, 0)
+        app.key(ui.KEY_1 + ui.TABS.index("texts"), None, 0)
         self.assertEqual(app.unread(), 0)
         self.assertEqual(app.items()[0]["time"], 20)  # newest first
+        self.assertEqual(app.items()[0]["dir"], "in")
 
 
 class MeTab(unittest.TestCase):
@@ -263,6 +317,15 @@ class MeTab(unittest.TestCase):
         self.assertEqual(svc.state["me"]["colour"], 0)
         app.key(ui.KEY_LEFT, None, 0)
         self.assertEqual(svc.state["me"]["colour"], 7)
+
+    def test_background_toggle(self):
+        svc = FakeService()
+        app = self.go(svc, "background")
+        app.key(ui.KEY_ENTER, None, 0)
+        self.assertFalse(svc.state["me"]["background"])
+        self.assertIn("stops a minute", app.toast[0])
+        app.key(ui.KEY_ENTER, None, 0)
+        self.assertTrue(svc.state["me"]["background"])
 
     def test_listen_only_toggle(self):
         svc = FakeService()
@@ -351,7 +414,7 @@ class WaveEsc(unittest.TestCase):
         app.key(ui.KEY_ENTER, None, 0)
         type_text(app, "hey")
         app.key(ui.KEY_ESC, None, 0)
-        self.assertEqual((app.mode, app.confirm), ("wave", True))
+        self.assertEqual((app.mode, app.confirm), ("text", True))
         type_text(app, "x")                        # carrying on typing clears the warning
         self.assertFalse(app.confirm)
         app.key(ui.KEY_ESC, None, 0)

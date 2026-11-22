@@ -446,6 +446,12 @@ class Files(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "file modes need Linux")
     def test_files_are_owner_only(self):
         with tempfile.TemporaryDirectory() as d:
+            old = os.path.join(d, "waves.json")  # left readable by 1.1
+            with open(old, "w") as f:
+                f.write("[]")
+            os.chmod(old, 0o644)
+            nb.load_node(d)
+            self.assertEqual(os.stat(old).st_mode & 0o777, 0o600)
             nb.save_node(d, nb.load_node(d))
             for f in os.listdir(d):
                 self.assertEqual(os.stat(os.path.join(d, f)).st_mode & 0o777, 0o600, f)

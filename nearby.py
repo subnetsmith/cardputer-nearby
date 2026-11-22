@@ -105,8 +105,8 @@ def key_events(buf):
 
 # ---------- the app's state ----------
 
-TABS = ["around", "met", "waves", "me"]
-ME_ROWS = ["nick", "colour", "status", "avatar", "listen"]
+TABS = ["around", "met", "texts", "me"]
+ME_ROWS = ["nick", "colour", "status", "avatar", "listen", "background"]
 
 
 def blank_grid():
@@ -135,13 +135,13 @@ class App:
         self.ask = ask
         self.state = None
         self.view, self.sel, self.me_sel = "around", 0, 0
-        self.mode = None          # None, "wave", "nick", "status" or "avatar"
+        self.mode = None          # None, "text", "nick", "status" or "avatar"
         self.original = None      # what the editor started with, to spot unsaved changes
         self.confirm = False      # Esc pressed once with unsaved changes
         self.text, self.target = "", None
         self.grid, self.cur = None, [8, 8]
         self.toast = None         # (text, until)
-        self.popup = None         # (wave, until)
+        self.popup = None         # (received text, until)
         self.newest_wave = None
 
     # --- data from the service ---
@@ -159,7 +159,7 @@ class App:
             if w["from"] not in self.state["me"]["muted"]:
                 self.popup = (w, now + 6)
         self.newest_wave = newest
-        if self.view == "waves" and newest > self.state["me"].get("waves_read", 0):
+        if self.view == "texts" and newest > self.state["me"].get("waves_read", 0):
             self.call({"cmd": "waves_read"}, now)
 
     def call(self, req, now, ok=None):
@@ -179,8 +179,10 @@ class App:
     def items(self):
         if not self.state:
             return []
-        if self.view == "waves":
-            return list(reversed(self.state["waves"]))
+        if self.view == "texts":  # received and sent, newest first
+            texts = [dict(w, dir="in", who=w["from"]) for w in self.state["waves"]] + \
+                    [dict(w, dir="out", who=w["to"]) for w in self.state.get("sent", [])]
+            return sorted(texts, key=lambda w: -w["time"])
         return self.state.get(self.view, []) if self.view != "me" else ME_ROWS
 
     def unread(self):
@@ -206,15 +208,15 @@ class App:
             else:
                 self._save_card(now)
             return True
-        if self.mode == "wave" and code == KEY_ESC:
-            # A wave isn't sent by Esc, so with text typed it asks before throwing it away.
+        if self.mode == "text" and code == KEY_ESC:
+            # A text isn't sent by Esc, so with something typed it asks before throwing it away.
             if self.unsaved() and not self.confirm:
                 self.confirm = True
             else:
                 self.mode, self.confirm = None, False
             return True
         self.confirm = False
-        if self.mode in ("wave", "nick", "status"):
+        if self.mode in ("text", "nick", "status"):
             self._typing(code, ch, now)
             return True
         code = NAV.get(code, code)
@@ -225,7 +227,7 @@ class App:
             return False
         if KEY_1 <= code <= KEY_4:
             self.view, self.sel = TABS[code - KEY_1], 0
-            if self.view == "waves":
+            if self.view == "texts":
                 self.call({"cmd": "waves_read"}, now)
             return True
         if self.view == "me":
@@ -238,15 +240,28 @@ class App:
             self.sel = min(max(0, len(items) - 1), self.sel + 1)
         elif not items:
             pass
-        elif code in (KEY_ENTER, KEY_W) and self.view in ("around", "met"):
-            self.edit("wave", "", items[self.sel])
+        elif code in (KEY_ENTER, KEY_W):
+            item = items[self.sel]
+            self.start_text(item["who"] if self.view == "texts" else item["id"], now)
         elif code == KEY_M:
-            cid = items[self.sel]["from"] if self.view == "waves" else items[self.sel]["id"]
+            cid = items[self.sel]["who"] if self.view == "texts" else items[self.sel]["id"]
             muted = cid in self.state["me"]["muted"]
             nick = (self.person(cid) or {"nick": "them"})["nick"]
             self.call({"cmd": "unmute" if muted else "mute", "id": cid}, now,
                       f"{nick} unmuted" if muted else f"{nick} muted: no more pop-ups or beeps")
         return True
+
+    def start_text(self, cid, now):
+        """Open the composer, or say why texting this person isn't possible yet."""
+        p = self.person(cid)
+        if p is None:
+            self.toast = ("They're not in your Met list", now + 3)
+        elif p.get("impostor"):
+            self.toast = (f"Someone is copying {p['nick']}'s card: texting is blocked", now + 4)
+        elif not p.get("can_text"):
+            self.toast = (f"{p['nick']}'s key hasn't arrived yet: stay close a few seconds", now + 4)
+        else:
+            self.edit("text", "", p)
 
     def edit(self, mode, value, target=None):
         """Open an editor on value (text, or avatar hex)."""
@@ -288,15 +303,20 @@ class App:
             on = not me["listen_only"]
             self.call({"cmd": "listen_only", "on": on}, now,
                       "Listen-only on: you're hidden" if on else "Listen-only off: others can see you")
+        elif ME_ROWS[self.me_sel] == "background":
+            on = not me.get("background", True)
+            self.call({"cmd": "background", "on": on}, now,
+                      "Background on: swaps cards even when closed" if on
+                      else "Background off: stops a minute after you close Nearby")
 
     def _typing(self, code, ch, now):
-        limit = {"wave": nearbyd.TEXT_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[self.mode]
+        limit = {"text": nearbyd.TEXT_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[self.mode]
         if code == KEY_BACKSPACE:
             self.text = self.text[:-1]
         elif code == KEY_ENTER:
-            if self.mode == "wave":
+            if self.mode == "text":
                 p = self.target
-                if self.call({"cmd": "text", "to": p["id"], "text": self.text}, now, f"Sending to {p['nick']} (encrypted)"):
+                if self.call({"cmd": "text", "to": p["id"], "text": self.text}, now, f"Sending to {p['nick']}…"):
                     self.mode = None
             else:
                 self._save_card(now)
@@ -377,15 +397,28 @@ def message(d, title, lines, icon=True):
         d.text((W // 2, y + 18 + 14 * i), line, font=SMALL, fill=DIM, anchor="mm")
 
 
+def wrap(d, text, fnt, width, lines=2):
+    """Split text into at most `lines` lines that fit `width`; the last one gets an ellipsis if cut."""
+    out, words = [], text.split(" ")
+    while words and len(out) < lines:
+        line = words.pop(0)
+        while words and d.textlength(line + " " + words[0], font=fnt) <= width:
+            line += " " + words.pop(0)
+        out.append(line)
+    if words:
+        out[-1] = fit(d, out[-1] + " " + " ".join(words), fnt, width)
+    return [fit(d, line, fnt, width) for line in out]
+
+
 def panel(d, top, bottom):
     d.rectangle([10, top, W - 11, bottom], fill=PANEL, outline=LINE)
 
 
 # ---------- screens ----------
 
-HINTS = {"around": "F/X pick  Enter wave  M mute  Esc quit",
-         "met": "F/X pick  Enter wave  M mute  Esc quit",
-         "waves": "F/X scroll  M mute sender  Esc quit",
+HINTS = {"around": "F/X pick  Enter text  M mute  Esc quit",
+         "met": "F/X pick  Enter text  M mute  Esc quit",
+         "texts": "F/X pick  Enter reply  M mute  Esc quit",
          "me": "F/X pick  Enter change  Z/C colour  Esc quit"}
 
 
@@ -402,7 +435,7 @@ def render(app, wall, now=0.0):
     d.ellipse([6, 7, 14, 15], fill=ACCENT)
     labels = {"around": f"1 Around {len(st['around'])}" if st else "1 Around",
               "met": f"2 Met {len(st['met'])}" if st else "2 Met",
-              "waves": "3 Waves", "me": "4 Me"}
+              "texts": "3 Texts", "me": "4 Me"}
     x = 22
     for key in TABS:
         label = labels[key]
@@ -410,7 +443,7 @@ def render(app, wall, now=0.0):
         d.text((x, TOP // 2), label, font=REG, fill=TEXT if key == app.view else DIM, anchor="lm")
         if key == app.view:
             d.rectangle([x, TOP - 3, x + tw, TOP - 1], fill=ACCENT)
-        if key == "waves" and app.unread():
+        if key == "texts" and app.unread():
             n = str(app.unread())
             d.rounded_rectangle([x + tw + 3, 4, x + tw + 9 + 6 * len(n), TOP - 5], radius=6, fill=ACCENT)
             d.text((x + tw + 6 + 3 * len(n), TOP // 2), n, font=SMALL, fill=BG, anchor="mm")
@@ -433,7 +466,7 @@ def render(app, wall, now=0.0):
     else:
         draw_list(img, d, app, wall)
 
-    if app.mode in ("wave", "nick", "status"):
+    if app.mode in ("text", "nick", "status"):
         draw_typing(d, app)
     if app.popup and now < app.popup[1]:
         draw_popup(img, d, app)
@@ -450,44 +483,61 @@ def draw_list(img, d, app, wall):
         elif app.view == "met":
             message(d, "No one met yet", ["Keep Nearby on in your pocket.", "People you pass show up here."])
         else:
-            message(d, "No waves yet", ["Pick someone in Around and press Enter", "to wave at them."])
+            message(d, "No texts yet", ["Pick someone in Around and press Enter.", "Texts are encrypted end to end."])
         return
+    texts = app.view == "texts"
+    row = 44 if texts else ROW  # texts get two lines for the message
+    rows = (H - TOP - BOTTOM) // row
     sel = min(app.sel, len(items) - 1)
-    first = min(max(0, sel - ROWS + 1), max(0, len(items) - ROWS))
+    first = min(max(0, sel - rows + 1), max(0, len(items) - rows))
     muted = st["me"]["muted"]
-    for i, item in enumerate(items[first:first + ROWS]):
-        y = TOP + 1 + i * ROW
+    for i, item in enumerate(items[first:first + rows]):
+        y = TOP + 1 + i * row
         if first + i == sel:
-            d.rectangle([0, y, W, y + ROW - 2], fill=PANEL)
-            d.rectangle([0, y, 2, y + ROW - 2], fill=ACCENT)
-        if app.view == "waves":
-            p = app.person(item["from"]) or {"avatar": "00" * 32, "colour": 0, "nick": item["nick"]}
-            name, line, cid = item["nick"], f"“{item['text']}”" if item["text"] else "waved", item["from"]
-            unread = item["time"] > st["me"].get("waves_read", 0)
-            d.text((W - 8, y + 16), short_ago(wall - item["time"]), font=SMALL, fill=ACCENT if unread else DIM, anchor="rm")
-            right = 52
-        else:
-            p, name, line, cid = item, item["nick"], item["status"] or "-", item["id"]
-            if app.view == "around":
-                bars = signal_bars(item["rssi"])
-                for b in range(4):
-                    h = 4 + 3 * b
-                    bx = W - 30 + b * 6
-                    d.rectangle([bx, y + 22 - h, bx + 3, y + 22], fill=PALETTE[item["colour"]] if b < bars else LINE)
-                right = 40
+            d.rectangle([0, y, W, y + row - 2], fill=PANEL)
+            d.rectangle([0, y, 2, y + row - 2], fill=ACCENT)
+        if texts:
+            cid = item["who"]
+            p = app.person(cid) or {"avatar": "00" * 32, "colour": 0, "nick": item["nick"]}
+            img.paste(avatar(p["avatar"], p["colour"], p["nick"]), (8, y + 7))
+            if item["dir"] == "in":
+                name = item["nick"] + ("  (muted)" if cid in muted else "")
+                unread = item["time"] > st["me"].get("waves_read", 0)
+                when, colour = short_ago(wall - item["time"]), ACCENT if unread else DIM
             else:
-                d.text((W - 8, y + 9), f"×{item['count']}", font=REG, fill=TEXT, anchor="rm")
-                d.text((W - 8, y + 23), short_ago(wall - item["last"]), font=SMALL, fill=DIM, anchor="rm")
-                right = 64
+                name = "To " + item["nick"]
+                when = "✓ delivered" if item.get("delivered") else \
+                    "sending…" if wall - item["time"] < nearbyd.TEXT_SECONDS else "not delivered"
+                colour = (80, 220, 120) if item.get("delivered") else DIM
+            d.text((44, y + 9), fit(d, name, BOLD, W - 140), font=BOLD, fill=TEXT, anchor="lm")
+            d.text((W - 8, y + 9), when, font=SMALL, fill=colour, anchor="rm")
+            for j, line in enumerate(wrap(d, item["text"], SMALL, W - 56)):
+                d.text((44, y + 23 + 12 * j), line, font=SMALL, fill=TEXT if item["dir"] == "in" else DIM, anchor="lm")
+            continue
+        p, name, line, cid = item, item["nick"], item["status"] or "-", item["id"]
+        if item.get("impostor"):
+            line = "⚠ someone is copying this card"
+        if app.view == "around":
+            bars = signal_bars(item["rssi"])
+            for b in range(4):
+                h = 4 + 3 * b
+                bx = W - 30 + b * 6
+                d.rectangle([bx, y + 22 - h, bx + 3, y + 22], fill=PALETTE[item["colour"]] if b < bars else LINE)
+            right = 40
+        else:
+            d.text((W - 8, y + 9), f"×{item['count']}", font=REG, fill=TEXT, anchor="rm")
+            d.text((W - 8, y + 23), short_ago(wall - item["last"]), font=SMALL, fill=DIM, anchor="rm")
+            right = 64
         img.paste(avatar(p["avatar"], p["colour"], p["nick"]), (8, y + 2))
         width = W - 44 - right
         if cid in muted:
             name += "  (muted)"
         d.text((44, y + 9), fit(d, name, BOLD, width), font=BOLD, fill=DIM if cid in muted else TEXT, anchor="lm")
-        d.text((44, y + 23), fit(d, line, SMALL, width), font=SMALL, fill=DIM, anchor="lm")
-    if len(items) > ROWS:  # scroll position
+        d.text((44, y + 23), fit(d, line, SMALL, width), font=SMALL,
+               fill=(255, 80, 70) if item.get("impostor") else DIM, anchor="lm")
+    if len(items) > rows:  # scroll position
         top_px = TOP + (H - TOP - BOTTOM) * first // len(items)
-        size = (H - TOP - BOTTOM) * ROWS // len(items)
+        size = (H - TOP - BOTTOM) * rows // len(items)
         d.rectangle([W - 2, top_px, W - 1, top_px + size], fill=DIM)
 
 
@@ -503,36 +553,44 @@ def draw_me(img, d, app):
               "colour": ("Colour", "◀ " + COLOUR_NAMES[me["colour"]] + " ▶"),
               "status": ("Status", me["status"] or "(none)"),
               "avatar": ("Avatar", "draw…"),
-              "listen": ("Listen-only", "on (hidden)" if me["listen_only"] else "off")}
+              "listen": ("Listen-only", "on (hidden)" if me["listen_only"] else "off"),
+              "background": ("Background", "on" if me.get("background", True) else "off (saves memory)")}
     for i, key in enumerate(ME_ROWS):
-        y = TOP + 4 + i * 25
+        y = TOP + 2 + i * 22
         if i == app.me_sel:
-            d.rectangle([118, y, W - 4, y + 22], fill=PANEL)
-            d.rectangle([118, y, 120, y + 22], fill=ACCENT)
+            d.rectangle([118, y, W - 4, y + 20], fill=PANEL)
+            d.rectangle([118, y, 120, y + 20], fill=ACCENT)
         label, value = values[key]
-        d.text((126, y + 11), label, font=SMALL, fill=DIM, anchor="lm")
+        d.text((126, y + 10), label, font=SMALL, fill=DIM, anchor="lm")
         if key == "colour":
-            d.rectangle([196, y + 6, 206, y + 16], fill=PALETTE[me["colour"]])
-            d.text((212, y + 11), value, font=REG, fill=TEXT, anchor="lm")
+            d.rectangle([196, y + 5, 206, y + 15], fill=PALETTE[me["colour"]])
+            d.text((212, y + 10), value, font=REG, fill=TEXT, anchor="lm")
         else:
-            d.text((196, y + 11), fit(d, value, REG, W - 204), font=REG, fill=TEXT, anchor="lm")
+            d.text((196, y + 10), fit(d, value, REG, W - 204), font=REG, fill=TEXT, anchor="lm")
 
 
 def draw_typing(d, app):
-    limit = {"wave": nearbyd.TEXT_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[app.mode]
-    title = {"wave": f"Wave at {app.target['nick']}" if app.mode == "wave" else "",
-             "nick": "Your nickname", "status": "Your status"}[app.mode]
-    panel(d, 34, 136)
-    d.text((22, 50), fit(d, title, BOLD, W - 44), font=BOLD, fill=TEXT, anchor="lm")
-    d.rectangle([22, 64, W - 23, 88], fill=BG, outline=ACCENT)
-    shown = app.text + "_"
-    d.text((28, 76), fit(d, shown, REG, W - 60), font=REG, fill=TEXT, anchor="lm")
-    d.text((W - 26, 76), f"{len(app.text)}/{limit}", font=SMALL, fill=DIM, anchor="rm")
-    d.text((22, 102), "Public: anyone nearby running Nearby can read it.", font=SMALL, fill=ACCENT, anchor="lm")
-    if app.confirm:
-        d.text((22, 122), "Not sent! Enter sends · Esc again discards", font=SMALL, fill=ACCENT, anchor="lm")
+    limit = {"text": nearbyd.TEXT_MAX, "nick": nearbyd.NICK_MAX, "status": nearbyd.STATUS_MAX}[app.mode]
+    panel(d, 28, 146)
+    if app.mode == "text":
+        nick = app.target["nick"]
+        d.text((22, 42), fit(d, f"Text {nick}", BOLD, 170), font=BOLD, fill=TEXT, anchor="lm")
+        d.text((W - 22, 42), "code " + app.target.get("code", "?"), font=SMALL, fill=DIM, anchor="rm")
     else:
-        d.text((22, 122), "Enter send   Esc cancel" if app.mode == "wave" else "Enter or Esc saves",
+        d.text((22, 42), "Your nickname" if app.mode == "nick" else "Your status", font=BOLD, fill=TEXT, anchor="lm")
+    d.rectangle([22, 54, W - 23, 92], fill=BG, outline=ACCENT)
+    for j, line in enumerate(wrap(d, app.text + "_", REG, W - 90)):
+        d.text((28, 65 + 15 * j), line, font=REG, fill=TEXT, anchor="lm")
+    d.text((W - 26, 85), f"{len(app.text)}/{limit}", font=SMALL, fill=DIM, anchor="rm")
+    if app.mode == "text":
+        d.text((22, 104), f"Encrypted: only {nick} can read it.", font=SMALL, fill=(80, 220, 120), anchor="lm")
+        d.text((22, 117), f"People nearby can see you texted {nick}.", font=SMALL, fill=DIM, anchor="lm")
+    else:
+        d.text((22, 104), "Public: anyone nearby running Nearby sees your card.", font=SMALL, fill=ACCENT, anchor="lm")
+    if app.confirm:
+        d.text((22, 133), "Not sent! Enter sends · Esc again discards", font=SMALL, fill=ACCENT, anchor="lm")
+    else:
+        d.text((22, 133), "Enter send   Esc cancel" if app.mode == "text" else "Enter or Esc saves",
                font=SMALL, fill=DIM, anchor="lm")
 
 
@@ -541,10 +599,11 @@ def draw_popup(img, d, app):
     p = app.person(w["from"]) or {"avatar": "00" * 32, "colour": 0, "nick": w["nick"]}
     panel(d, 30, 140)
     d.rectangle([10, 30, W - 11, 33], fill=PALETTE[p["colour"]])
-    img.paste(avatar(p["avatar"], p["colour"], p["nick"], size=48), (24, 50))
-    d.text((86, 58), fit(d, f"{w['nick']} waved", BIG, W - 110), font=BIG, fill=TEXT, anchor="lm")
-    d.text((86, 84), fit(d, f"“{w['text']}”" if w["text"] else "(no message)", REG, W - 110), font=REG, fill=TEXT, anchor="lm")
-    d.text((W // 2, 126), "any key to close", font=SMALL, fill=DIM, anchor="mm")
+    img.paste(avatar(p["avatar"], p["colour"], p["nick"], size=48), (24, 48))
+    d.text((86, 56), fit(d, f"{w['nick']} texted you", BIG, W - 110), font=BIG, fill=TEXT, anchor="lm")
+    for j, line in enumerate(wrap(d, w["text"], REG, W - 110, lines=3)):
+        d.text((86, 80 + 15 * j), line, font=REG, fill=TEXT, anchor="lm")
+    d.text((W // 2, 130), "any key to close · 3 for Texts", font=SMALL, fill=DIM, anchor="mm")
 
 
 def draw_avatar_editor(img, d, app):
@@ -590,15 +649,21 @@ class Screen:
 def run():
     screen = Screen()
     keys = os.open(KEYBOARD, os.O_RDONLY | os.O_NONBLOCK)
-    app, kb, fetched = App(nearbyd.ask), Keyboard(), 0.0
+    app, kb, fetched, drawn = App(nearbyd.ask), Keyboard(), 0.0, None
     try:
         while True:
             now = time.monotonic()
             if now - fetched >= 1 and app.mode is None:  # don't move the list under the user while typing
                 app.refresh(now)
                 fetched = now
-            screen.show(render(app, time.time(), now))
-            if select.select([keys], [], [], 0.2)[0]:
+            # Redraw only when something visible changed: idle redraws cost ~9% CPU on battery.
+            frame = (repr(app.state), app.view, app.sel, app.me_sel, app.mode, app.text, app.confirm,
+                     repr(app.grid), app.cur, bool(app.toast and now < app.toast[1]),
+                     bool(app.popup and now < app.popup[1]), int(time.time() // 30))
+            if frame != drawn:
+                screen.show(render(app, time.time(), now))
+                drawn = frame
+            if select.select([keys], [], [], 1.0)[0]:  # a key wakes it at once
                 for code, ch in kb.feed(key_events(os.read(keys, EVENT.size * 32))):
                     if not app.key(code, ch, time.monotonic()):
                         return

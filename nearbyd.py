@@ -557,6 +557,8 @@ def save_json(path, value):
 
 def load_node(folder):
     os.makedirs(folder, mode=0o700, exist_ok=True)
+    for name in os.listdir(folder):  # files from 1.1 were 0644: make everything owner-only
+        os.chmod(os.path.join(folder, name), 0o600)
     me = load_json(os.path.join(folder, "profile.json"), None)
     if me is None:
         me = new_profile()
