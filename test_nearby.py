@@ -1,4 +1,6 @@
+import os
 import struct
+import sys
 import unittest
 
 import nearby as nb
@@ -177,6 +179,19 @@ class Screen(unittest.TestCase):
             self.assertLessEqual(len(lines), 10)
             self.assertTrue(all(len(line) <= 40 for line in lines), lines)
         self.assertIn("and 2 more", nb.screen(people))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "select on pipes needs Linux")
+    def test_quit_keys(self):
+        for typed, want in ((b"", False), (b"q", True), (b"Q", True), (b"\x1b", True),
+                            (b"\x1b[A", False), (b"x", False)):
+            r, w = os.pipe()
+            try:
+                if typed:
+                    os.write(w, typed)
+                self.assertEqual(nb.quit_pressed(r), want, typed)
+            finally:
+                os.close(r)
+                os.close(w)
 
     def test_beep_plays_as_sudo_user(self):
         env = {"SUDO_USER": "alice", "SUDO_UID": "1000"}

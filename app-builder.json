@@ -1,0 +1,27 @@
+{
+  "package_name": "nearby",
+  "version": "1.0.0",
+  "app_name": "Nearby",
+  "bin_name": "nearby",
+  "description": "Beep when another CardputerZero running nearby is close",
+  "store": {
+    "summary": "Beeps when another Cardputer running Nearby is close",
+    "description": "Each CardputerZero running Nearby sends a small anonymous Bluetooth LE beacon and listens for the others. When one comes close it beeps and shows roughly how far away it is: right here, close, nearby or far.\n\nOnly devices running Nearby can see each other. The beacon uses a random address that changes every 15 minutes, so it can't be used to follow you around.\n\nPress q to quit. Nearby uses sudo to talk to the Bluetooth chip directly. Source code is linked below.",
+    "categories": ["Radio & Comms", "Security"],
+    "screenshots": ["screenshots/screenshot-0.png"],
+    "icon": "packaging/icon.png",
+    "license": "MIT",
+    "source_repo": "https://github.com/subnetsmith/cardputer-nearby",
+    "author": { "github": "subnetsmith", "display_name": "subnetsmith" },
+    "share_code": "NRBY",
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": false,
+      "additional_hardware": false,
+      "background_service": false,
+      "external_display": false
+    }
+  }
+}

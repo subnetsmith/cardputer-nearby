@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Nearby
+Exec=/usr/bin/sudo -n -- /usr/bin/nearby
+Terminal=true
+Icon=share/images/nearby.png

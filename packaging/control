@@ -1,0 +1,13 @@
+Package: nearby
+Version: @VERSION@
+Architecture: all
+Maintainer: subnetsmith <291419189+subnetsmith@users.noreply.github.com>
+Depends: python3, sudo
+Recommends: alsa-utils
+Section: utils
+Priority: optional
+Homepage: https://github.com/subnetsmith/cardputer-nearby
+Description: Beep when another CardputerZero running nearby is close
+ Each device sends a small anonymous Bluetooth LE beacon and listens for the
+ others, then beeps and shows roughly how close they are. Only devices running
+ nearby can see each other. The beacon address changes every 15 minutes.

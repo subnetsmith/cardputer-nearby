@@ -8,6 +8,7 @@ needs Linux, root and nothing else (standard library only).
 import argparse
 import os
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -176,7 +177,7 @@ class Tracker:
 def screen(people):
     """Fits the 320x170 screen's console (40 columns, 10 rows)."""
     if not people:
-        return "NEARBY\n\nNo other Cardputers around.\n\nListening... (Ctrl+C to stop)"
+        return "NEARBY\n\nNo other Cardputers around.\n\nListening...  (q to quit)"
     head = f"NEARBY  {len(people)} other Cardputer{'s' if len(people) > 1 else ''}"
     rows = [f"{i}. {label:<11}{rssi:>5} dBm" for i, (label, rssi) in enumerate(people[:7], 1)]
     if len(people) > 7:
@@ -261,6 +262,14 @@ class Radio:
         self.sock.close()
 
 
+def quit_pressed(fd):
+    """q or a lone Esc waiting on fd? (An arrow key also starts with Esc, so it doesn't count.)"""
+    if not select.select([fd], [], [], 0)[0]:
+        return False
+    data = os.read(fd, 32)
+    return data[:1] in (b"q", b"Q") or data == b"\x1b"
+
+
 def run(dev, quiet):
     radio = Radio(dev)
     tracker = Tracker()
@@ -270,9 +279,17 @@ def run(dev, quiet):
         os.close(fd)
         make_beep(sound)
         os.chmod(sound, 0o644)  # readable by the sudo user who plays it
+    keys = None
+    if sys.stdin.isatty():  # launched from the Cardputer's terminal: read single keys, no echo
+        import termios
+        import tty
+        keys = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin)
     rotate_at = drawn_at = 0.0
     try:
         while True:
+            if keys and quit_pressed(sys.stdin.fileno()):
+                raise KeyboardInterrupt
             now = time.monotonic()
             if now >= rotate_at:
                 radio.start()
@@ -293,6 +310,8 @@ def run(dev, quiet):
                 drawn_at = now
     finally:
         radio.stop()
+        if keys:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, keys)
         if sound:
             os.remove(sound)
 

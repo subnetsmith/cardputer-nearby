@@ -15,14 +15,24 @@ sudo curl -fsSL -o /usr/local/bin/nearby https://raw.githubusercontent.com/subne
 
 One file, Python 3 standard library only. No pip.
 
+To get a launcher icon on the CardputerZero, build the `.deb` instead (on any Debian-based
+machine, the Cardputer included) and install it:
+
+```sh
+sh packaging/build-deb.sh && sudo dpkg -i build/nearby_*_all.deb
+```
+
 ## Use
+
+Open **Nearby** from the launcher, or from a terminal:
 
 ```sh
 sudo nearby          # beep + screen
 sudo nearby --quiet  # screen only
 ```
 
-It needs root because it talks to the Bluetooth chip directly. Ctrl+C turns the beacon off.
+It needs root because it talks to the Bluetooth chip directly. Press q or Esc (or Ctrl+C) to quit;
+the beacon turns off when it exits.
 
 A CardputerZero next to a Raspberry Pi 4 running it too:
 
